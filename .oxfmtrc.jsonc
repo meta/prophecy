@@ -1,0 +1,33 @@
+{
+  "$schema": "./node_modules/oxfmt/configuration_schema.json",
+  "printWidth": 120,
+  "tabWidth": 4,
+  // Keep the key order that Yarn writes.
+  "sortPackageJson": false,
+  "ignorePatterns": [
+    "dist/",
+    "node_modules/",
+    // Analyzer inputs: tests assert their line and column numbers, and some are malformed on purpose.
+    "tests-unit/static/fixtures/",
+    // Agent rules and skills, which have their own linters.
+    ".llms/",
+    // Meta's shared open source files, copied to the repository root on export.
+    "/CODE_OF_CONDUCT.md",
+    "/CONTRIBUTING.md"
+  ],
+  "overrides": [
+    {
+      "files": ["*.json", "*.jsonc", "*.md"],
+      "options": {
+        "tabWidth": 2
+      }
+    },
+    {
+      // Keep JSONC config files valid JSON apart from their comments.
+      "files": ["*.jsonc"],
+      "options": {
+        "trailingComma": "none"
+      }
+    }
+  ]
+}

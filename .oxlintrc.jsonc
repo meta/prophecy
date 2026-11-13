@@ -1,0 +1,18 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["typescript", "unicorn", "oxc"],
+  "categories": {
+    "correctness": "error"
+  },
+  "rules": {
+    // `new Array(n)` preallocates arrays that are then filled by index.
+    "unicorn/no-new-array": "off",
+    // Copying a collection before iterating snapshots it for loops that may change it.
+    "unicorn/no-useless-spread": "off"
+  },
+  "ignorePatterns": [
+    "dist/**",
+    // Analyzer inputs: tests assert their line and column numbers, and some are malformed on purpose.
+    "tests-unit/static/fixtures/**"
+  ]
+}

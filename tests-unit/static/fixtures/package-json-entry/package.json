@@ -1,0 +1,5 @@
+{
+  "name": "test-extension",
+  "main": "./src/extension",
+  "activationEvents": ["onStartupFinished"]
+}

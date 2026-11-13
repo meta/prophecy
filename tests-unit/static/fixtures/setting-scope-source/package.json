@@ -1,0 +1,16 @@
+{
+  "name": "demo",
+  "main": "./extension",
+  "contributes": {
+    "configuration": {
+      "title": "Demo",
+      "properties": {
+        "demo.serverPath": {"type": "string", "scope": "machine"},
+        "demo.toolPath": {"type": "string", "scope": "application"},
+        "demo.command": {"type": "string"},
+        "demo.server.enable": {"type": "boolean", "scope": "window"},
+        "demo.server.path": {"type": "string", "scope": "machine"}
+      }
+    }
+  }
+}
