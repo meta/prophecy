@@ -338,6 +338,7 @@ export function resolveCommandRegistration(
 
 class CommandRegistrationResolver {
     private callCache = new WeakMap<ts.CallExpression, CommandRegistration | null>();
+    private directSymbolCache = new WeakMap<ts.Symbol, boolean>();
     private summaryCache = new WeakMap<ts.FunctionLikeDeclaration, CommandRegistrationSummary | null>();
     private resolving = new Set<ts.FunctionLikeDeclaration>();
 
@@ -523,8 +524,13 @@ class CommandRegistrationResolver {
             symbol = this.checker.getAliasedSymbol(symbol);
         }
         if (symbol) {
-            const fqn = this.checker.getFullyQualifiedName(symbol).replace(/^"([^"]+)"\./, "$1.");
-            if (fqn === "vscode.commands.registerCommand") return true;
+            let direct = this.directSymbolCache.get(symbol);
+            if (direct === undefined) {
+                const fqn = this.checker.getFullyQualifiedName(symbol).replace(/^"([^"]+)"\./, "$1.");
+                direct = fqn === "vscode.commands.registerCommand";
+                this.directSymbolCache.set(symbol, direct);
+            }
+            if (direct) return true;
 
             if (!seen.has(symbol)) {
                 seen.add(symbol);
