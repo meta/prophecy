@@ -454,6 +454,8 @@ export interface InterproceduralContext {
     getModuleInstance?(symbol: ts.Symbol, create: () => InstanceState): InstanceState;
     getModuleInstanceState?(): Map<ts.Symbol, InstanceState>;
     setModuleInstanceState?(state: Map<ts.Symbol, InstanceState>): void;
+    /** Whether indexed program syntax preserves the Array.from constructor and array-like prototype contract. */
+    arrayFromBuiltinsUnmodified?(): boolean;
 
     analyzeHostCallback?(
         callExpr: ts.CallExpression,
@@ -1240,7 +1242,13 @@ export class TaintTracker {
             const left = a.instanceBindings.get(symbol);
             const right = b.instanceBindings.get(symbol);
             const instance = left && right ? mergeInstances(left, right) : (left ?? right);
-            if (instance) instanceBindings.set(symbol, instance);
+            if (instance)
+                instanceBindings.set(
+                    symbol,
+                    (!left || !right) && instance.valueExpression
+                        ? { ...instance, valueExpression: undefined }
+                        : instance,
+                );
         }
 
         const moduleInstances = new Map<ts.Symbol, InstanceState>();
@@ -2658,6 +2666,17 @@ export class TaintTracker {
             return true;
         if (ts.isAwaitExpression(expr)) return this.isProvenClean(expr.expression, seen);
         if (ts.isIdentifier(expr)) {
+            const payload = this.resolveInstance(expr);
+            if (
+                !payload?.valueTaints?.length &&
+                payload?.valueExpression &&
+                payload.fields.size === 0 &&
+                payload.fieldInstances.size === 0 &&
+                payload.elementInstances.size === 0 &&
+                payload.functions.length === 0 &&
+                (ts.isNumericLiteral(payload.valueExpression) || ts.isVoidExpression(payload.valueExpression))
+            )
+                return this.isProvenClean(payload.valueExpression, seen);
             const symbol = this.checker.getSymbolAtLocation(expr);
             if (symbol && this.cleanBindings.has(symbol)) return true;
             if (
@@ -2802,7 +2821,9 @@ export class TaintTracker {
         );
     }
 
-    private hostCallKind(expr: ts.CallExpression): "promiseStatic" | "promise" | "array" | "event" | undefined {
+    private hostCallKind(
+        expr: ts.CallExpression,
+    ): "promiseStatic" | "promise" | "arrayFrom" | "array" | "event" | undefined {
         const callee = expr.expression;
         if (!ts.isPropertyAccessExpression(callee)) return undefined;
         const name = callee.name.text;
@@ -2817,6 +2838,15 @@ export class TaintTracker {
         // receiver retains its original declared type.
         if (instance?.elementInstances.has(name) || (this.resolveInstance(callee)?.functions.length ?? 0) > 0)
             return undefined;
+        if (
+            name === "from" &&
+            this.apiIdentity.importedName(callee.expression) === "Array" &&
+            this.interproc?.arrayFromBuiltinsUnmodified?.() === true &&
+            this.apiIdentity.matchesAPI(callee, "Array.from") &&
+            this.standardMethod(callee, ["ArrayConstructor"]) &&
+            this.arrayFromLengthOnlyMapper(expr)
+        )
+            return "arrayFrom";
         if (
             ["then", "catch"].includes(name) &&
             (this.hasHostType(instance, "Promise") || this.standardMethod(callee, ["Promise"]))
@@ -3132,6 +3162,94 @@ export class TaintTracker {
         return result;
     }
 
+    /** A fresh length-only literal has no own indexed properties or iterator. */
+    private arrayFromLengthOnlyMapper(expr: ts.CallExpression): ts.ArrowFunction | ts.FunctionExpression | undefined {
+        if (expr.arguments.length < 2 || expr.arguments.length > 3 || expr.arguments.some(ts.isSpreadElement))
+            return undefined;
+        const input = unwrapExpression(expr.arguments[0]);
+        const mapper = unwrapExpression(expr.arguments[1]);
+        if (!ts.isObjectLiteralExpression(input) || input.properties.length !== 1) return undefined;
+        const property = input.properties[0];
+        if (
+            (!ts.isPropertyAssignment(property) && !ts.isShorthandPropertyAssignment(property)) ||
+            this.propertyName(property.name) !== "length"
+        )
+            return undefined;
+        if (
+            (!ts.isArrowFunction(mapper) && !ts.isFunctionExpression(mapper)) ||
+            mapper.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword) ||
+            (ts.isFunctionExpression(mapper) && mapper.asteriskToken != null)
+        )
+            return undefined;
+        return mapper;
+    }
+
+    private analyzeArrayFrom(
+        expr: ts.CallExpression,
+        state: TaintState,
+        args: CallArgument[],
+    ): { taints?: TaintValue[] } {
+        const input = unwrapExpression(args[0].expression) as ts.ObjectLiteralExpression;
+        const length = input.properties[0];
+        if (
+            ts.isPropertyAssignment(length) &&
+            ts.isNumericLiteral(length.initializer) &&
+            Number(length.initializer.text) === 0
+        ) {
+            const empty = createInstanceState();
+            empty.apiTypes = ["Array"];
+            return this.finishHostCall(expr, empty);
+        }
+        const element = ts.factory.createVoidZero();
+        const index = ts.factory.createNumericLiteral(0);
+        const receiver = args[2]?.instance;
+        if (receiver && args[2].taints?.length) {
+            for (const property of this.checker.getTypeAtLocation(args[2].expression).getProperties()) {
+                const name = property.name;
+                if (!receiver.elementInstances.has(name))
+                    receiver.elementInstances.set(
+                        name,
+                        this.hostValue(TaintTracker.taintsForAggregateProperty(args[2].taints, name)),
+                    );
+            }
+        }
+        const result = this.invokeHostCallback(
+            expr,
+            args[1].instance,
+            [
+                { expression: element, instance: this.hostValue([], undefined, element) },
+                // This representative scalar proves numeric provenance, not a particular position or array size.
+                { expression: index, instance: this.hostValue([], undefined, index) },
+            ],
+            state,
+            receiver,
+            true,
+        );
+        const unknownReceiver =
+            args[2] != null &&
+            (receiver == null ||
+                receiver.classDeclarationsUnknown === true ||
+                receiver.elementInstances.has("$unknownReturn") ||
+                (this.checker.getTypeAtLocation(args[2].expression).flags &
+                    (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !==
+                    0 ||
+                args[2].taints?.some((taint) => !taint.aggregatePropertyPath?.length) === true);
+        const unknown = unknownReceiver || !result || result.truncated || result.returnUnknown;
+        const values = [...(result?.returnTaints ?? []), ...(unknown ? args.flatMap((arg) => arg.taints ?? []) : [])];
+        if (unknown) {
+            // A partial summary cannot attach input field paths or clean element identities to an unknown result.
+            const returned = this.finishHostCall(expr, createInstanceState(), values);
+            this.expressionInstanceState.delete(expr);
+            this.cleanExpressions.delete(expr);
+            return returned;
+        }
+        const output = createInstanceState();
+        output.apiTypes = ["Array"];
+        output.elementInstances.set("$taint:*", this.hostValue(values));
+        if (result?.instanceState) output.elementInstances.set("*", result.instanceState);
+        return this.finishHostCall(expr, output, values);
+    }
+
     private analyzeHostCall(
         expr: ts.CallExpression,
         state: TaintState,
@@ -3175,6 +3293,7 @@ export class TaintTracker {
             const taints = this.analyzeExpression(expression, state);
             return { expression, taints, instance: this.resolveValueInstance(expression, state) };
         });
+        if (kind === "arrayFrom") return this.analyzeArrayFrom(expr, state, args);
         if (kind === "array" && method === "flat") {
             return this.analyzeArrayFlat(expr, receiver, receiverTaints, args);
         }

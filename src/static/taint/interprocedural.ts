@@ -330,6 +330,12 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
     private continuations = new Map<string, { handlers: RegisteredHandler[]; index: number }>();
     private moduleInstances = new Map<ts.Symbol, InstanceState>();
     private usedModuleInstances = false;
+    private indexedArrayFromBuiltins = false;
+    private arrayFromBuiltinOverride = false;
+
+    arrayFromBuiltinsUnmodified(): boolean {
+        return this.indexedArrayFromBuiltins && !this.arrayFromBuiltinOverride;
+    }
 
     getModuleInstanceState(): Map<ts.Symbol, InstanceState> {
         return this.moduleInstances;
@@ -430,8 +436,11 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
      * participate.
      */
     indexSubtypes(sourceFiles: ts.SourceFile[]): void {
+        this.indexedArrayFromBuiltins = true;
         for (const file of sourceFiles) {
             this.walkTree(file, (node) => {
+                if (!this.arrayFromBuiltinOverride && this.affectsArrayFromBuiltins(node))
+                    this.arrayFromBuiltinOverride = true;
                 if (!ts.isClassLike(node) && !ts.isInterfaceDeclaration(node)) return;
                 for (const clause of node.heritageClauses ?? []) {
                     for (const type of clause.types) {
@@ -445,6 +454,209 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
                 }
             });
         }
+    }
+
+    private arrayFromErasedTypeUse(node: ts.Node): boolean {
+        for (let parent = node.parent; parent; parent = parent.parent) {
+            if (ts.isExpressionWithTypeArguments(parent)) {
+                const heritage = parent.parent;
+                return (
+                    ts.isHeritageClause(heritage) &&
+                    (ts.isInterfaceDeclaration(heritage.parent) || heritage.token === ts.SyntaxKind.ImplementsKeyword)
+                );
+            }
+            if (ts.isTypeNode(parent)) return true;
+            if (ts.isExpression(parent) || ts.isStatement(parent)) return false;
+        }
+        return false;
+    }
+
+    /** Indexed source syntax is a conservative veto, including writes in another module or later branch. */
+    private affectsArrayFromBuiltins(node: ts.Node): boolean {
+        const identity = APIIdentityCache.forChecker(this.checker);
+        const name = (expression: ts.Expression, seen = new Set<ts.Symbol>()): string | undefined => {
+            const value = unwrapExpression(expression);
+            if (ts.isIdentifier(value) && ["globalThis", "global", "window", "self"].includes(value.text)) {
+                const declarations = this.checker.getSymbolAtLocation(value)?.declarations;
+                if (
+                    (value.text === "globalThis" && !declarations?.length) ||
+                    (declarations?.length &&
+                        declarations.every(
+                            (declaration) =>
+                                declaration.getSourceFile().isDeclarationFile &&
+                                (declaration.getSourceFile().hasNoDefaultLib ||
+                                    (ts.isVariableDeclaration(declaration) && !declaration.initializer)),
+                        ))
+                )
+                    return "globalThis";
+            }
+            if (ts.isPropertyAccessExpression(value) || ts.isElementAccessExpression(value)) {
+                const base = name(value.expression, seen);
+                const key = ts.isPropertyAccessExpression(value)
+                    ? value.name.text
+                    : ts.isStringLiteralLike(value.argumentExpression)
+                      ? value.argumentExpression.text
+                      : resolveStaticString(this.checker, value.argumentExpression);
+                if (base && key) return base === "globalThis" ? key : `${base}.${key}`;
+            }
+            if (ts.isIdentifier(value)) {
+                let symbol = this.checker.getSymbolAtLocation(value);
+                if (symbol && symbol.flags & ts.SymbolFlags.Alias) symbol = this.checker.getAliasedSymbol(symbol);
+                const declaration = symbol?.valueDeclaration;
+                if (
+                    symbol &&
+                    !seen.has(symbol) &&
+                    declaration &&
+                    ts.isVariableDeclaration(declaration) &&
+                    declaration.initializer
+                ) {
+                    seen.add(symbol);
+                    return name(declaration.initializer, seen);
+                }
+            }
+            const imported = identity.importedName(value);
+            return imported && !imported.startsWith(".") ? imported : undefined;
+        };
+        const member = (
+            expression: ts.Expression,
+        ): { receiver: string | undefined; key: string | undefined } | undefined => {
+            const value = unwrapExpression(expression);
+            if (ts.isPropertyAccessExpression(value)) return { receiver: name(value.expression), key: value.name.text };
+            if (ts.isElementAccessExpression(value)) {
+                const key = unwrapExpression(value.argumentExpression);
+                return {
+                    receiver: name(value.expression),
+                    key:
+                        ts.isStringLiteralLike(key) || ts.isNumericLiteral(key)
+                            ? key.text
+                            : resolveStaticString(this.checker, key),
+                };
+            }
+            return undefined;
+        };
+        const prototype = (receiver: string | undefined): boolean =>
+            receiver === "Object.prototype" || receiver === "Array.prototype";
+        const indexed = (key: string | undefined): boolean =>
+            key == null || /^(0|[1-9]\d*)$/.test(key) || key === "__proto__";
+        const replaced = (expression: ts.Expression): boolean => {
+            const value = name(expression);
+            if (value === "Array" || value === "Object.prototype" || value === "Array.prototype") return true;
+            const property = member(expression);
+            return (
+                property != null &&
+                ((property.receiver === "Array" && (property.key == null || property.key === "from")) ||
+                    (prototype(property.receiver) && indexed(property.key)))
+            );
+        };
+        if (ts.isElementAccessExpression(node) || ts.isPropertyAccessExpression(node)) {
+            const property = member(node)!;
+            // Exposure can lose its constructor name through literals, containers or assignments.
+            if (
+                ["__proto__", "prototype", "constructor"].includes(property.key ?? "") ||
+                (prototype(property.receiver) && indexed(property.key)) ||
+                (property.key == null && ["Array", "Object", "Reflect", "globalThis"].includes(property.receiver ?? ""))
+            )
+                return true;
+        }
+        if (ts.isBindingElement(node) && ts.isObjectBindingPattern(node.parent)) {
+            const property = node.propertyName ?? node.name;
+            const key =
+                ts.isIdentifier(property) || ts.isStringLiteralLike(property)
+                    ? property.text
+                    : ts.isComputedPropertyName(property)
+                      ? resolveStaticString(this.checker, property.expression)
+                      : undefined;
+            if (["__proto__", "prototype", "constructor"].includes(key ?? "")) return true;
+        }
+        if (ts.isPropertyAssignment(node) || ts.isShorthandPropertyAssignment(node)) {
+            const property = node.name;
+            const key =
+                ts.isIdentifier(property) || ts.isStringLiteralLike(property)
+                    ? property.text
+                    : ts.isComputedPropertyName(property)
+                      ? resolveStaticString(this.checker, property.expression)
+                      : undefined;
+            const assignment = ts.findAncestor(
+                node,
+                (ancestor) =>
+                    ts.isBinaryExpression(ancestor) &&
+                    ancestor.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+                    ancestor.left.pos <= node.pos &&
+                    ancestor.left.end >= node.end,
+            );
+            if (assignment && ["__proto__", "prototype", "constructor"].includes(key ?? "")) return true;
+        }
+        if (
+            ts.isExpression(node) &&
+            !this.arrayFromErasedTypeUse(node) &&
+            ["Array", "Object", "Reflect", "globalThis"].includes(name(node) ?? "")
+        ) {
+            const parent = node.parent;
+            const declaration = ts.isIdentifier(node)
+                ? this.checker.getSymbolAtLocation(node)?.valueDeclaration
+                : undefined;
+            const declarationName = declaration && "name" in declaration ? declaration.name : undefined;
+            const staticReceiver =
+                (ts.isPropertyAccessExpression(parent) || ts.isElementAccessExpression(parent)) &&
+                parent.expression === node &&
+                member(parent)?.key != null;
+            const propertyName = ts.isPropertyAccessExpression(parent) && parent.name === node;
+            const constAlias =
+                ts.isVariableDeclaration(parent) &&
+                parent.initializer === node &&
+                ts.isIdentifier(parent.name) &&
+                (parent.parent.flags & ts.NodeFlags.Const) !== 0 &&
+                !(
+                    ts.isVariableStatement(parent.parent.parent) &&
+                    parent.parent.parent.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword)
+                );
+            const wrapped = ts.isExpression(parent) && unwrapExpression(parent) === node;
+            if (declarationName !== node && !propertyName && !staticReceiver && !constAlias && !wrapped) return true;
+        }
+        if (ts.isShorthandPropertyAssignment(node)) {
+            const symbol = this.checker.getShorthandAssignmentValueSymbol(node);
+            if (
+                symbol &&
+                ["Array", "Object", "Reflect", "globalThis"].includes(symbol.name) &&
+                symbol.declarations?.some((declaration) => declaration.getSourceFile().hasNoDefaultLib)
+            )
+                return true;
+            const declaration = symbol?.valueDeclaration;
+            if (
+                declaration &&
+                ts.isVariableDeclaration(declaration) &&
+                declaration.initializer &&
+                ["Array", "Object", "Reflect", "globalThis"].includes(name(declaration.initializer) ?? "")
+            )
+                return true;
+        }
+        if (
+            ts.isCallExpression(node) &&
+            [
+                "Object.getPrototypeOf",
+                "Reflect.getPrototypeOf",
+                "Reflect.get",
+                "Object.getOwnPropertyDescriptor",
+                "Object.getOwnPropertyDescriptors",
+                "Object.prototype.__lookupGetter__",
+                "Object.prototype.__lookupSetter__",
+            ].includes(name(node.expression) ?? "")
+        )
+            return true;
+        if (
+            (ts.isBinaryExpression(node) &&
+                node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+                node.operatorToken.kind <= ts.SyntaxKind.LastAssignment &&
+                replaced(node.left)) ||
+            (ts.isDeleteExpression(node) && replaced(node.expression))
+        )
+            return true;
+        return (
+            ts.isCallExpression(node) &&
+            node.arguments.some((argument) =>
+                ["Array", "Object", "Object.prototype", "Array.prototype", "globalThis"].includes(name(argument) ?? ""),
+            )
+        );
     }
 
     /**
