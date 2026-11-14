@@ -332,9 +332,15 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
     private usedModuleInstances = false;
     private indexedArrayFromBuiltins = false;
     private arrayFromBuiltinOverride = false;
+    private indexedArraySortBuiltins = false;
+    private arrayPrototypeAccess = false;
 
     arrayFromBuiltinsUnmodified(): boolean {
         return this.indexedArrayFromBuiltins && !this.arrayFromBuiltinOverride;
+    }
+
+    hasArrayPrototypeAccess(): boolean {
+        return !this.indexedArraySortBuiltins || this.arrayPrototypeAccess;
     }
 
     getModuleInstanceState(): Map<ts.Symbol, InstanceState> {
@@ -430,17 +436,132 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
         return this.settingScopes?.scopeOf(key);
     }
 
+    private inertPrototypeUse(node: ts.Node, seen = new Set<ts.Symbol>()): boolean {
+        let value = node;
+        while (
+            value.parent &&
+            (ts.isParenthesizedExpression(value.parent) ||
+                ts.isAsExpression(value.parent) ||
+                ts.isNonNullExpression(value.parent) ||
+                (ts.isConditionalExpression(value.parent) &&
+                    (value.parent.whenTrue === value || value.parent.whenFalse === value)))
+        )
+            value = value.parent;
+        const parent = value.parent;
+        if (
+            parent &&
+            ts.isBinaryExpression(parent) &&
+            (parent.operatorToken.kind === ts.SyntaxKind.EqualsEqualsEqualsToken ||
+                parent.operatorToken.kind === ts.SyntaxKind.ExclamationEqualsEqualsToken)
+        )
+            return true;
+        if (
+            !parent ||
+            !ts.isVariableDeclaration(parent) ||
+            !ts.isIdentifier(parent.name) ||
+            parent.initializer !== value ||
+            (ts.getCombinedNodeFlags(parent) & ts.NodeFlags.Const) === 0
+        )
+            return false;
+        const sourceFile = parent.getSourceFile();
+        if (!ts.isExternalModule(sourceFile) || (ts.getCombinedModifierFlags(parent) & ts.ModifierFlags.Export) !== 0)
+            return false;
+        const symbol = this.checker.getSymbolAtLocation(parent.name);
+        if (!symbol || seen.has(symbol)) return false;
+        const module = this.checker.getSymbolAtLocation(sourceFile);
+        if (
+            module &&
+            this.checker
+                .getExportsOfModule(module)
+                .some(
+                    (exported) =>
+                        (exported.flags & ts.SymbolFlags.Alias ? this.checker.getAliasedSymbol(exported) : exported) ===
+                        symbol,
+                )
+        )
+            return false;
+        seen.add(symbol);
+        let inert = true;
+        this.walkTree(parent.getSourceFile(), (reference) => {
+            if (reference === parent.name || !ts.isIdentifier(reference)) return;
+            const referenced = ts.isShorthandPropertyAssignment(reference.parent)
+                ? this.checker.getShorthandAssignmentValueSymbol(reference.parent)
+                : this.checker.getSymbolAtLocation(reference);
+            if (referenced === symbol && !this.inertPrototypeUse(reference, new Set(seen))) inert = false;
+        });
+        return inert;
+    }
+
     /**
      * Index the class hierarchy used for abstract and interface dispatch.
      * Include all project source files so implementations in other modules
      * participate.
      */
     indexSubtypes(sourceFiles: ts.SourceFile[]): void {
+        this.indexedArraySortBuiltins = false;
         this.indexedArrayFromBuiltins = true;
         for (const file of sourceFiles) {
             this.walkTree(file, (node) => {
                 if (!this.arrayFromBuiltinOverride && this.affectsArrayFromBuiltins(node))
                     this.arrayFromBuiltinOverride = true;
+                const prototypeReceiver =
+                    ts.isPropertyAccessExpression(node) && node.name.text === "prototype"
+                        ? node.expression
+                        : ts.isElementAccessExpression(node) &&
+                            ts.isStringLiteralLike(node.argumentExpression) &&
+                            node.argumentExpression.text === "prototype"
+                          ? node.expression
+                          : undefined;
+                const assignedGlobal =
+                    ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
+                        ? unwrapExpression(node.left)
+                        : undefined;
+                const prototypeMember = prototypeReceiver && node.parent;
+                const otherMember =
+                    prototypeMember &&
+                    ((ts.isPropertyAccessExpression(prototypeMember) && prototypeMember.name.text !== "sort") ||
+                        (ts.isElementAccessExpression(prototypeMember) &&
+                            ts.isStringLiteralLike(prototypeMember.argumentExpression) &&
+                            prototypeMember.argumentExpression.text !== "sort"));
+                const prototypeLookup =
+                    ts.isCallExpression(node) &&
+                    (APIIdentityCache.forChecker(this.checker)
+                        .importedName(node.expression)
+                        ?.endsWith(".getPrototypeOf") === true ||
+                        (ts.isPropertyAccessExpression(node.expression) &&
+                            node.expression.name.text === "getPrototypeOf"));
+                const constructorAccess =
+                    (ts.isPropertyAccessExpression(node) && node.name.text === "constructor") ||
+                    (ts.isElementAccessExpression(node) &&
+                        ts.isStringLiteralLike(node.argumentExpression) &&
+                        node.argumentExpression.text === "constructor");
+                const legacyPrototype =
+                    (ts.isPropertyAccessExpression(node) && node.name.text === "__proto__") ||
+                    (ts.isElementAccessExpression(node) &&
+                        ts.isStringLiteralLike(node.argumentExpression) &&
+                        node.argumentExpression.text === "__proto__");
+                const prototypeUse =
+                    prototypeReceiver != null || prototypeLookup || legacyPrototype || constructorAccess;
+                const candidate =
+                    otherMember || (prototypeUse && this.inertPrototypeUse(node))
+                        ? assignedGlobal
+                        : (prototypeReceiver ?? assignedGlobal);
+                const unwrapped = candidate && unwrapExpression(candidate);
+                const identity = unwrapped && APIIdentityCache.forChecker(this.checker).importedName(unwrapped);
+                const type = candidate && this.checker.getTypeAtLocation(candidate);
+                const constructor = type?.getSymbol();
+                if (
+                    ((prototypeLookup || legacyPrototype || constructorAccess) && !this.inertPrototypeUse(node)) ||
+                    (candidate &&
+                        (identity === "Array" ||
+                            identity === "globalThis.Array" ||
+                            (prototypeReceiver && (type!.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0))) ||
+                    (constructor?.getName() === "ArrayConstructor" &&
+                        constructor.declarations?.some((declaration) => declaration.getSourceFile().hasNoDefaultLib))
+                ) {
+                    // Even a prototype alias can be mutated by an unresolved call in another module.
+                    this.arrayPrototypeAccess = true;
+                }
                 if (!ts.isClassLike(node) && !ts.isInterfaceDeclaration(node)) return;
                 for (const clause of node.heritageClauses ?? []) {
                     for (const type of clause.types) {
@@ -454,6 +575,7 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
                 }
             });
         }
+        this.indexedArraySortBuiltins = true;
     }
 
     private arrayFromErasedTypeUse(node: ts.Node): boolean {

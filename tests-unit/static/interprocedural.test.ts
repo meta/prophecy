@@ -15,6 +15,36 @@ describe("InterproceduralAnalyzer entry-point isolation", () => {
         await initTaintValueHashing();
     });
 
+    it.each([false, true])("retains replaced-sort taint with subtype indexing %s", (indexed) => {
+        const { checker, sourceFiles } = parseSource(
+            `
+            import { exec } from "child_process";
+            import * as fs from "fs";
+            declare function unknown(value: unknown): any;
+            Array.prototype.sort = function() { return unknown(this); };
+            export function activate() {
+                const rows = [{name: fs.readFileSync('/state', 'utf8'), folder: 'fixed'}];
+                exec(rows.sort((a, b) => a.name.localeCompare(b.name))[0].folder);
+            }
+        `,
+            "/src/replacedSort.ts",
+        );
+        const analyzer = new InterproceduralAnalyzer(checker, vscodeExtensionSpec, 5);
+        analyzer.buildVSCodeCommandRegistry(sourceFiles);
+        if (indexed) analyzer.indexSubtypes(sourceFiles);
+        const entries = analyzer.discoverEntryPoints(sourceFiles);
+        expect(entries).toHaveLength(1);
+        const result = analyzer.analyzeEntryPoints(entries);
+        expect(result.skippedEntryPoints).toEqual([]);
+        expect(
+            result.findings.some(
+                (finding) =>
+                    finding.source.pattern === "fs.readFileSync" &&
+                    finding.sinkLocation.text === "exec(rows.sort((a, b) => a.name.localeCompare(b.name))[0].folder)",
+            ),
+        ).toBe(true);
+    });
+
     it("skips a throwing entry point with a warning and still analyzes the rest", () => {
         // Two independent findings-producing entry points: a URI handler and
         // a command handler, each flowing tainted input into child_process.exec.

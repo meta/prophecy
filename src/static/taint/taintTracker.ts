@@ -474,6 +474,9 @@ export interface InterproceduralContext {
         argInstances?: (InstanceState | undefined)[],
     ): InterproceduralCallResult | undefined;
 
+    /** A program-visible Array prototype access can replace or escape native methods. */
+    hasArrayPrototypeAccess?(): boolean;
+
     /** Whether a call to an abstract or interface method has implementations to analyze. */
     hasOverrideCandidates(callExpr: ts.CallExpression): boolean;
 
@@ -2544,8 +2547,22 @@ export class TaintTracker {
         if (sourceTaint) return [sourceTaint];
         const stringField = this.resolveInstance(expr.expression)?.elementInstances.get(expr.name.text);
         if (stringField) return stringField.valueTaints?.slice();
-        if (expr.name.text === "length" && this.hasHostType(this.resolveInstance(expr.expression), "Array"))
-            return undefined;
+        if (expr.name.text === "length" && this.hasHostType(this.resolveInstance(expr.expression), "Array")) {
+            const length = this.resolveInstance(expr.expression)!.elementInstances.get("$sortLength")?.valueTaints;
+            return length?.length
+                ? length.map((taint) =>
+                      propagate(
+                          taint,
+                          {
+                              kind: "propertyAccess",
+                              location: this.nodeLocation(expr),
+                              description: "accessed property 'length'",
+                          },
+                          this.metrics,
+                      ),
+                  )
+                : undefined;
+        }
 
         if (objectTaints) {
             const propertyTaints = TaintTracker.taintsForProperty(objectTaints, expr.name.text);
@@ -2827,17 +2844,17 @@ export class TaintTracker {
         const callee = expr.expression;
         if (!ts.isPropertyAccessExpression(callee)) return undefined;
         const name = callee.name.text;
+        const instance = this.resolveInstance(callee.expression);
+        // An own replacement is not the library implementation, even when the
+        // receiver retains its original declared type.
+        if (instance?.elementInstances.has(name) || (this.resolveInstance(callee)?.functions.length ?? 0) > 0)
+            return undefined;
         if (
             ["resolve", "reject", "all"].includes(name) &&
             this.apiIdentity.importedName(callee.expression) === "Promise" &&
             this.standardMethod(callee, ["PromiseConstructor"])
         )
             return "promiseStatic";
-        const instance = this.resolveInstance(callee.expression);
-        // An own replacement is not the library implementation, even when the
-        // receiver retains its original declared type.
-        if (instance?.elementInstances.has(name) || (this.resolveInstance(callee)?.functions.length ?? 0) > 0)
-            return undefined;
         if (
             name === "from" &&
             this.apiIdentity.importedName(callee.expression) === "Array" &&
@@ -2853,7 +2870,15 @@ export class TaintTracker {
         )
             return "promise";
         if (
-            ["map", "filter", "flat"].includes(name) &&
+            name === "sort" &&
+            (!this.standardMethod(callee, ["Array"]) ||
+                instance?.elementInstances.has("$unknownReturn") ||
+                instance?.classDeclarations?.length ||
+                (this.interproc?.hasArrayPrototypeAccess?.() ?? true))
+        )
+            return undefined;
+        if (
+            ["map", "filter", "flat", "sort"].includes(name) &&
             (this.hasHostType(instance, "Array") || this.standardMethod(callee, ["Array", "ReadonlyArray"]))
         )
             return "array";
@@ -3250,6 +3275,93 @@ export class TaintTracker {
         return this.finishHostCall(expr, output, values);
     }
 
+    private markSortEscape(instance: InstanceState | undefined, seen = new Set<InstanceState>()): void {
+        if (!instance || seen.has(instance)) return;
+        if (
+            instance.fields.size === 0 &&
+            instance.fieldInstances.size === 0 &&
+            instance.elementInstances.size === 0 &&
+            (instance.functions.length > 0 ||
+                (instance.valueExpression && this.hasPrimitiveType(instance.valueExpression)))
+        )
+            return;
+        seen.add(instance);
+        instance.elementInstances.set("$sortEscape", this.hostValue());
+        for (const [key, nested] of instance.elementInstances) {
+            if (!key.startsWith("$")) this.markSortEscape(nested, seen);
+        }
+        for (const nested of instance.fieldInstances.values()) this.markSortEscape(nested, seen);
+    }
+
+    private hasSortEscape(instance: InstanceState | undefined, seen = new Set<InstanceState>()): boolean {
+        if (!instance || seen.has(instance)) return false;
+        seen.add(instance);
+        return (
+            instance.elementInstances.has("$sortEscape") ||
+            [...instance.elementInstances].some(
+                ([key, nested]) => !key.startsWith("$") && this.hasSortEscape(nested, seen),
+            ) ||
+            [...instance.fieldInstances.values()].some((nested) => this.hasSortEscape(nested, seen))
+        );
+    }
+
+    private static readonly sortComparatorWrites = new WeakMap<ts.Symbol, boolean>();
+
+    private knownSortComparator(expression: ts.Expression, seen = new Set<ts.Symbol>()): boolean {
+        const value = unwrapExpression(expression);
+        if (ts.isArrowFunction(value) || ts.isFunctionExpression(value)) return true;
+        if (ts.isConditionalExpression(value)) {
+            return (
+                this.knownSortComparator(value.whenTrue, new Set(seen)) &&
+                this.knownSortComparator(value.whenFalse, new Set(seen))
+            );
+        }
+        if (!ts.isIdentifier(value)) return false;
+        const symbol = this.resolveSymbol(value);
+        const declaration = symbol?.valueDeclaration;
+        if (!symbol || !declaration || seen.has(symbol)) return false;
+        seen.add(symbol);
+        if (
+            ts.isVariableDeclaration(declaration) &&
+            declaration.initializer &&
+            (ts.getCombinedNodeFlags(declaration) & ts.NodeFlags.Const) !== 0
+        ) {
+            return this.knownSortComparator(declaration.initializer, seen);
+        }
+        if (!ts.isFunctionDeclaration(declaration) || !declaration.body) return false;
+        let written = TaintTracker.sortComparatorWrites.get(symbol);
+        if (written == null) {
+            written = false;
+            const pending: ts.Node[] = [declaration.getSourceFile()];
+            while (pending.length) {
+                const node = pending.pop()!;
+                if (
+                    ts.isBinaryExpression(node) &&
+                    node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+                    node.operatorToken.kind <= ts.SyntaxKind.LastAssignment &&
+                    this.resolveSymbol(unwrapExpression(node.left)) === symbol
+                ) {
+                    written = true;
+                    break;
+                }
+                node.forEachChild((child) => {
+                    pending.push(child);
+                });
+            }
+            TaintTracker.sortComparatorWrites.set(symbol, written);
+        }
+        return !written;
+    }
+
+    private uniqueSortTaints(taints: readonly TaintValue[]): TaintValue[] {
+        const facts = new Map<string, TaintValue>();
+        for (const taint of taints) {
+            const key = this.taintFactKey(taint);
+            if (!facts.has(key)) facts.set(key, taint);
+        }
+        return [...facts.values()];
+    }
+
     private analyzeHostCall(
         expr: ts.CallExpression,
         state: TaintState,
@@ -3296,6 +3408,151 @@ export class TaintTracker {
         if (kind === "arrayFrom") return this.analyzeArrayFrom(expr, state, args);
         if (kind === "array" && method === "flat") {
             return this.analyzeArrayFlat(expr, receiver, receiverTaints, args);
+        }
+        if (kind === "array" && method === "sort") {
+            const callback = args[0]?.instance;
+            const comparator = args[0]?.expression && unwrapExpression(args[0].expression);
+            if (
+                comparator &&
+                (!callback?.functions.length || !this.knownSortComparator(comparator)) &&
+                (this.checker.getTypeAtLocation(comparator).flags & ts.TypeFlags.Undefined) === 0
+            )
+                return undefined;
+            if (this.hasSortEscape(receiver)) return undefined;
+            const output = receiver ?? createInstanceState();
+            output.apiTypes = ["Array"];
+            let elements = this.flatElements(receiver, receiverTaints, callee.expression);
+            const defaultComparator =
+                comparator == null || (this.checker.getTypeAtLocation(comparator).flags & ts.TypeFlags.Undefined) !== 0;
+            const elementType = this.checker.getTypeAtLocation(callee.expression).getNumberIndexType();
+            const types = elementType?.isUnion() ? elementType.types : elementType ? [elementType] : [];
+            const primitiveElements =
+                types.length > 0 &&
+                types.every(
+                    (type) =>
+                        (type.flags &
+                            (ts.TypeFlags.StringLike |
+                                ts.TypeFlags.NumberLike |
+                                ts.TypeFlags.BooleanLike |
+                                ts.TypeFlags.BigIntLike |
+                                ts.TypeFlags.Null |
+                                ts.TypeFlags.Undefined)) !==
+                        0,
+                );
+            let comparatorIncomplete = false;
+            if (callback && (elements.length > 1 || elements.some((element) => element.unknownSpread))) {
+                const combined: CallArgument = {
+                    expression: callee.expression,
+                    taints: elements.flatMap((element) => element.taints ?? []),
+                    instance: mergeInstanceStates(
+                        elements.flatMap((element) => (element.instance ? [element.instance] : [])),
+                    ),
+                };
+                const inline =
+                    comparator != null && (ts.isArrowFunction(comparator) || ts.isFunctionExpression(comparator));
+                for (const element of elements) {
+                    const first = this.invokeHostCallback(
+                        expr,
+                        callback,
+                        [element, combined],
+                        state,
+                        undefined,
+                        inline,
+                    );
+                    const second = this.invokeHostCallback(
+                        expr,
+                        callback,
+                        [combined, element],
+                        state,
+                        undefined,
+                        inline,
+                    );
+                    comparatorIncomplete ||= !first || first.truncated === true || !second || second.truncated === true;
+                }
+                // Comparator writes to the receiver are alternatives to its original contents.
+                elements.push(...this.flatElements(output, receiverTaints, callee.expression));
+            }
+            if (
+                ((defaultComparator && !primitiveElements) ||
+                    comparatorIncomplete ||
+                    this.hasSortEscape(output) ||
+                    elements.some((element) => this.hasSortEscape(element.instance))) &&
+                (elements.length > 1 || elements.some((element) => element.unknownSpread))
+            ) {
+                // Unknown coercions and escaped comparator arguments can reshape element fields.
+                const effects = this.uniqueSortTaints(
+                    TaintTracker.clearAggregatePropertyPath(elements.flatMap((element) => element.taints ?? [])),
+                );
+                for (const element of elements) {
+                    if (element.instance && elementType) {
+                        for (const property of elementType.getProperties()) {
+                            element.instance.fields.set(
+                                property,
+                                this.uniqueSortTaints([
+                                    ...(this.getInstanceField(element.instance, property) ?? []),
+                                    ...effects,
+                                ]),
+                            );
+                        }
+                    }
+                }
+                for (const [symbol, instance] of this.instanceFieldState) {
+                    if (instance === output || elements.some((element) => element.instance === instance)) {
+                        state.set(symbol, this.uniqueSortTaints([...(state.get(symbol) ?? []), ...effects]));
+                    }
+                }
+                elements = elements.map((element) => ({ ...element, taints: [...(element.taints ?? []), ...effects] }));
+            }
+            elements = elements.map((element) => ({ ...element, taints: this.uniqueSortTaints(element.taints ?? []) }));
+            const elementsByValue = new Map<InstanceState | ts.Expression, CallArgument>();
+            for (const element of elements) {
+                const key = element.instance ?? element.expression;
+                const previous = elementsByValue.get(key);
+                elementsByValue.set(
+                    key,
+                    previous
+                        ? {
+                              ...previous,
+                              unknownSpread: previous.unknownSpread || element.unknownSpread,
+                              taints: this.uniqueSortTaints([...(previous.taints ?? []), ...(element.taints ?? [])]),
+                          }
+                        : element,
+                );
+            }
+            elements = [...elementsByValue.values()];
+            // Sorting invalidates ordered slots, not the objects or field paths stored in them.
+            for (const key of output.elementInstances.keys()) {
+                if (/^(?:\$taint:)?(?:0|[1-9]\d*)$/.test(key) || key === "*" || key === "$taint:*")
+                    output.elementInstances.delete(key);
+            }
+            output.taintedElementsFromIndex = undefined;
+            const taints = this.uniqueSortTaints(elements.flatMap((element) => element.taints ?? []));
+            if (elements.length) {
+                output.elementInstances.set("$taint:*", this.hostValue(taints));
+                const instance = mergeInstanceStates(
+                    elements.flatMap((element) => (element.instance ? [element.instance] : [])),
+                );
+                if (instance) output.elementInstances.set("*", instance);
+            }
+            // Collection metadata has separate provenance from the element field paths.
+            const length = TaintTracker.taintsForProperty(receiverTaints ?? [], "length");
+            output.elementInstances.set(
+                "$sortLength",
+                this.hostValue(
+                    length.map((taint) =>
+                        propagate(
+                            taint,
+                            {
+                                kind: "return",
+                                location: this.nodeLocation(expr),
+                                description: `returned from ${expr.expression.getText()}()`,
+                            },
+                            this.metrics,
+                        ),
+                    ),
+                ),
+            );
+            return this.finishHostCall(expr, output, taints);
         }
         if (kind === "promiseStatic") {
             let promise: InstanceState;
@@ -3563,9 +3820,20 @@ export class TaintTracker {
         let evaluatedReceiver: { taints?: TaintValue[] } | undefined;
         if (
             ts.isPropertyAccessExpression(expr.expression) &&
-            ["then", "catch", "map", "filter", "on", "once", "addListener", "emit", "write", "end", "pipe"].includes(
-                expr.expression.name.text,
-            )
+            [
+                "then",
+                "catch",
+                "map",
+                "filter",
+                "sort",
+                "on",
+                "once",
+                "addListener",
+                "emit",
+                "write",
+                "end",
+                "pipe",
+            ].includes(expr.expression.name.text)
         ) {
             const receiver = unwrapExpression(expr.expression.expression);
             if (ts.isCallExpression(receiver) || ts.isNewExpression(receiver) || ts.isAwaitExpression(receiver)) {
@@ -3827,6 +4095,12 @@ export class TaintTracker {
                     if (callResult.canReturn === false) this.nonReturningExpressions.add(expr);
                 }
                 if (returnedInstance) {
+                    if (
+                        this.hasHostType(returnedInstance, "Array") &&
+                        (callResult.truncated || returnUnknown || callResult.returnInstanceUnknown)
+                    ) {
+                        returnedInstance.elementInstances.set("$sortEscape", this.hostValue());
+                    }
                     this.expressionInstanceState.set(expr, returnedInstance);
                 }
                 if (!callResult.truncated && !returnUnknown && !callResult.returnTaints?.length) {
@@ -3851,6 +4125,11 @@ export class TaintTracker {
             }
         }
 
+        // Only sort eligibility consumes this escape marker; other host models retain their contracts.
+        for (const instance of argInstances) this.markSortEscape(instance);
+        if (ts.isPropertyAccessExpression(expr.expression) || ts.isElementAccessExpression(expr.expression)) {
+            this.markSortEscape(this.resolveInstance(expr.expression.expression));
+        }
         // Unresolved call passthrough: if we can't see inside the function,
         // propagate taint from arguments and receiver to the return value.
         const passthroughTaints: TaintValue[] = [...incompleteReturnTaints];
@@ -5612,6 +5891,26 @@ export class TaintTracker {
         }
     }
 
+    private assignmentReceiver(expression: ts.Expression): InstanceState | undefined {
+        const known = this.resolveInstance(expression);
+        if (known) return known;
+        const symbol = this.resolveSymbol(expression);
+        if (
+            symbol?.getName() !== "Promise" ||
+            !symbol.valueDeclaration?.getSourceFile().hasNoDefaultLib ||
+            !this.interproc?.getModuleInstance
+        )
+            return undefined;
+        // Allocate constructor state only for writes, not ordinary Promise calls.
+        const instance = this.interproc.getModuleInstance(symbol, () => {
+            const value = createInstanceState();
+            value.apiTypes = ["PromiseConstructor"];
+            return value;
+        });
+        this.instanceFieldState.set(symbol, instance);
+        return instance;
+    }
+
     private assignPropertyTaint(
         target: ts.PropertyAccessExpression,
         taints: TaintValue[] | undefined,
@@ -5619,7 +5918,7 @@ export class TaintTracker {
         assignment: ts.Node,
     ): void {
         const directThisProperty = this.getThisPropertySymbol(target) || this.getThisAliasPropertySymbol(target);
-        const receiver = this.resolveInstance(target.expression);
+        const receiver = this.assignmentReceiver(target.expression);
         const property = directThisProperty ?? (receiver ? this.resolveSymbol(target.name) : undefined);
         if (!property) {
             if (receiver) receiver.elementInstances.set(target.name.text, this.hostValue(taints));
@@ -5651,7 +5950,7 @@ export class TaintTracker {
     }
 
     private assignPropertyInstance(target: ts.PropertyAccessExpression, instance: InstanceState | undefined): void {
-        const receiver = this.resolveInstance(target.expression);
+        const receiver = this.assignmentReceiver(target.expression);
         if (!receiver) return;
 
         const property = this.resolveSymbol(target.name);
