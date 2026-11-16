@@ -3365,7 +3365,8 @@ export class TaintTracker {
     private analyzeHostCall(
         expr: ts.CallExpression,
         state: TaintState,
-        evaluatedReceiver?: { taints?: TaintValue[] },
+        receiverTaints: TaintValue[] | undefined,
+        evaluatedArguments: { value?: CallArgument[] },
     ): { taints?: TaintValue[] } | undefined {
         const resolver = this.resolveInstance(expr.expression);
         const target = resolver?.elementInstances.get("$promise");
@@ -3374,15 +3375,19 @@ export class TaintTracker {
             (this.hasHostType(resolver, "Promise.resolveCallback") ||
                 this.hasHostType(resolver, "Promise.rejectCallback"))
         ) {
-            const taints = expr.arguments.map((arg) => this.analyzeExpression(arg, state));
+            const args = expr.arguments.map((expression) => {
+                const taints = this.analyzeExpression(expression, state);
+                return { expression, taints, instance: this.resolveValueInstance(expression, state) };
+            });
+            evaluatedArguments.value = args;
             if (!target.elementInstances.has("$fulfilled") && !target.elementInstances.has("$rejected")) {
                 target.elementInstances.delete("$unknownReturn");
                 const expression = expr.arguments[0] ?? ts.factory.createVoidZero();
-                const instance = expr.arguments[0] && this.resolveValueInstance(expr.arguments[0], state);
+                const instance = args[0]?.instance;
                 if (this.hasHostType(resolver, "Promise.rejectCallback")) {
-                    target.elementInstances.set("$rejected", this.hostValue(taints[0], instance, expression));
+                    target.elementInstances.set("$rejected", this.hostValue(args[0]?.taints, instance, expression));
                 } else {
-                    const resolved = this.promiseValue(taints[0], instance, expression);
+                    const resolved = this.promiseValue(args[0]?.taints, instance, expression);
                     for (const [key, value] of resolved.elementInstances) target.elementInstances.set(key, value);
                 }
             }
@@ -3393,9 +3398,6 @@ export class TaintTracker {
         if (!kind) return undefined;
         const callee = expr.expression as ts.PropertyAccessExpression;
         const method = callee.name.text;
-        const receiverTaints = evaluatedReceiver
-            ? evaluatedReceiver.taints
-            : this.analyzeExpression(callee.expression, state);
         const receiver = this.resolveInstance(callee.expression);
         const args: CallArgument[] = expr.arguments.map((expression) => {
             const value = unwrapExpression(expression);
@@ -3405,6 +3407,7 @@ export class TaintTracker {
             const taints = this.analyzeExpression(expression, state);
             return { expression, taints, instance: this.resolveValueInstance(expression, state) };
         });
+        evaluatedArguments.value = args;
         if (kind === "arrayFrom") return this.analyzeArrayFrom(expr, state, args);
         if (kind === "array" && method === "flat") {
             return this.analyzeArrayFlat(expr, receiver, receiverTaints, args);
@@ -3817,30 +3820,33 @@ export class TaintTracker {
     private analyzeCallExpression(expr: ts.CallExpression, state: TaintState): TaintValue[] | undefined {
         this.metrics.performance.callExpressions++;
         this.cleanExpressions.delete(expr);
-        let evaluatedReceiver: { taints?: TaintValue[] } | undefined;
-        if (
-            ts.isPropertyAccessExpression(expr.expression) &&
-            [
-                "then",
-                "catch",
-                "map",
-                "filter",
-                "sort",
-                "on",
-                "once",
-                "addListener",
-                "emit",
-                "write",
-                "end",
-                "pipe",
-            ].includes(expr.expression.name.text)
-        ) {
-            const receiver = unwrapExpression(expr.expression.expression);
-            if (ts.isCallExpression(receiver) || ts.isNewExpression(receiver) || ts.isAwaitExpression(receiver)) {
-                evaluatedReceiver = { taints: this.analyzeExpression(expr.expression.expression, state) };
-            }
+        // A call captures its callee and receiver before evaluating arguments.
+        // These per-evaluation roots also travel through argument branch snapshots.
+        const callee = unwrapExpression(expr.expression);
+        this.expressionInstanceState.delete(callee);
+        let receiverTaints: TaintValue[] | undefined;
+        let receiverBeforeArguments: InstanceState | undefined;
+        const member =
+            ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee) ? callee : undefined;
+        if (member) {
+            this.expressionInstanceState.delete(member.expression);
+            receiverTaints = this.analyzeExpression(member.expression, state);
+            receiverBeforeArguments = this.resolveInstance(member.expression);
+            if (receiverBeforeArguments) this.expressionInstanceState.set(member.expression, receiverBeforeArguments);
+            if (ts.isElementAccessExpression(member)) this.analyzeExpression(member.argumentExpression, state);
+        } else {
+            this.analyzeExpression(expr.expression, state);
         }
-        const hostResult = this.analyzeHostCall(expr, state, evaluatedReceiver);
+        const calleeBeforeArguments = this.resolveInstance(callee);
+        if (calleeBeforeArguments) this.expressionInstanceState.set(callee, calleeBeforeArguments);
+        // A declaration fixes callable identity, but its free bindings are read
+        // when it is invoked, after argument side effects have happened.
+        const declaredCallee =
+            !calleeBeforeArguments && ts.isIdentifier(callee)
+                ? resolveFunctionReference(this.checker, callee)
+                : undefined;
+        const evaluatedArguments: { value?: CallArgument[] } = {};
+        const hostResult = this.analyzeHostCall(expr, state, receiverTaints, evaluatedArguments);
         if (hostResult) return hostResult.taints;
 
         const callName = getCallChainName(expr.expression);
@@ -3869,10 +3875,19 @@ export class TaintTracker {
                 ? commandCallback
                 : undefined;
 
-        // Analyze arguments first to get their taints
         const argTaints: (TaintValue[] | undefined)[] = [];
         const argInstances: (InstanceState | undefined)[] = [];
-        for (const arg of expr.arguments) {
+        for (const [index, arg] of expr.arguments.entries()) {
+            const evaluated = evaluatedArguments.value?.[index];
+            if (evaluated) {
+                // A declined host model still needs definition-site closure
+                // coverage, but must not evaluate argument expressions again.
+                const value = unwrapExpression(arg);
+                if (ts.isArrowFunction(value) || ts.isFunctionExpression(value)) this.analyzeClosureBody(value, state);
+                argTaints.push(evaluated.taints);
+                argInstances.push(evaluated.instance);
+                continue;
+            }
             argTaints.push(
                 arg === synchronousForEachCallback ||
                     (arg === separatelyAnalyzedCommandCallback &&
@@ -3882,9 +3897,6 @@ export class TaintTracker {
             );
             argInstances.push(this.resolveValueInstance(ts.isSpreadElement(arg) ? arg.expression : arg, state));
         }
-
-        // Also analyze the callee expression
-        if (!evaluatedReceiver) this.analyzeExpression(expr.expression, state);
 
         if (this.matchesModelAPI(expr.expression, "axios.create")) {
             const receiver = ts.isPropertyAccessExpression(expr.expression)
@@ -3904,7 +3916,7 @@ export class TaintTracker {
         this.checkAxiosDefaults(expr);
 
         if (synchronousForEachCallback) {
-            this.analyzeSynchronousForEachCallback(expr, synchronousForEachCallback, state);
+            this.analyzeSynchronousForEachCallback(expr, synchronousForEachCallback, state, receiverTaints);
         }
 
         const sanitizer = this.matchingSanitizer(expr);
@@ -3917,8 +3929,6 @@ export class TaintTracker {
 
         const elementSanitizer = this.arrayMapSanitizer(expr);
         if (elementSanitizer != null) {
-            const receiver = (expr.expression as ts.PropertyAccessExpression).expression;
-            const receiverTaints = this.analyzeExpression(receiver, state);
             if (!receiverTaints || receiverTaints.length === 0) return undefined;
             return this.applySanitizer(
                 receiverTaints,
@@ -4006,9 +4016,9 @@ export class TaintTracker {
             // interprocedural analysis can see it via extractInstanceFieldState.
             const savedFieldEntries: [ts.Symbol, readonly TaintValue[] | undefined][] = [];
             let receiverInstance: InstanceState | undefined;
-            if (ts.isPropertyAccessExpression(expr.expression) || ts.isElementAccessExpression(expr.expression)) {
-                receiverInstance = this.resolveInstance(expr.expression.expression);
-            } else if (expr.expression.kind === ts.SyntaxKind.SuperKeyword) {
+            if (member && receiverBeforeArguments) {
+                receiverInstance = this.expressionInstanceState.get(member.expression) ?? receiverBeforeArguments;
+            } else if (callee.kind === ts.SyntaxKind.SuperKeyword) {
                 receiverInstance = this.currentThisInstance;
             }
             if (receiverInstance) {
@@ -4018,9 +4028,11 @@ export class TaintTracker {
                 }
             }
 
-            const calleeInstance =
-                this.resolveInstance(expr.expression) ??
-                (ts.isIdentifier(expr.expression) ? this.resolveValueInstance(expr.expression, state) : undefined);
+            const calleeInstance = calleeBeforeArguments
+                ? (this.expressionInstanceState.get(callee) ?? calleeBeforeArguments)
+                : declaredCallee?.body
+                  ? createFunctionInstance(this.captureDeclaredFunctionValue(declaredCallee, state))
+                  : undefined;
             const boundFunctions = calleeInstance?.functions ?? [];
             const callResult = calleeInstance?.hostCallback
                 ? this.interproc.analyzeHostCallback?.(expr, calleeInstance, state, this.depth)
@@ -4143,9 +4155,6 @@ export class TaintTracker {
         // taintedObj["method"](), the receiver carries taint even when
         // there are no arguments.
         if (ts.isPropertyAccessExpression(expr.expression)) {
-            const receiverTaints = evaluatedReceiver
-                ? evaluatedReceiver.taints
-                : this.analyzeExpression(expr.expression.expression, state);
             if (receiverTaints) {
                 const sortIdentity =
                     expr.expression.name.text === "sort" ? this.modelAPIContext(expr.expression) : undefined;
@@ -4162,7 +4171,6 @@ export class TaintTracker {
                 );
             }
         } else if (ts.isElementAccessExpression(expr.expression)) {
-            const receiverTaints = this.analyzeExpression(expr.expression.expression, state);
             if (receiverTaints) {
                 const methodName = ts.isStringLiteralLike(expr.expression.argumentExpression)
                     ? expr.expression.argumentExpression.text
@@ -5790,9 +5798,9 @@ export class TaintTracker {
         call: ts.CallExpression,
         callback: ts.ArrowFunction | ts.FunctionExpression,
         state: TaintState,
+        receiverTaints: TaintValue[] | undefined,
     ): void {
         const receiver = (call.expression as ts.PropertyAccessExpression).expression;
-        const receiverTaints = this.analyzeExpression(receiver, state);
 
         const callbackState: TaintState = new Map();
         const capturedAt = this.nodeLocation(callback);
