@@ -35,6 +35,13 @@ export function parseProject(projectDir: string, excludePaths: string[] = []): P
     if (configPath) {
         const configFile = ts.readConfigFile(configPath, ts.sys.readFile);
         const parsedConfig = ts.parseJsonConfigFileContent(configFile.config, ts.sys, path.dirname(configPath));
+        if (parsedConfig.fileNames.length === 0 && parsedConfig.projectReferences?.length) {
+            throw new Error(
+                `${configPath} has project references but no input files. ` +
+                    "Project-reference traversal is not supported; scan the referenced project directories " +
+                    "with separate --project arguments and their own tsconfig.json files.",
+            );
+        }
         if (parsedConfig.options.typeRoots == null) {
             const typeRoots = collectNodeModulesTypeRoots(projectDir);
             if (typeRoots.length > 0) parsedConfig.options.typeRoots = typeRoots;

@@ -1,0 +1,5 @@
+{
+    "name": "reference-app",
+    "private": true,
+    "main": "extension.ts"
+}

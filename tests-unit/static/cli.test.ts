@@ -192,6 +192,43 @@ describe("CLI smoke tests", () => {
         expect(JSON.parse(stdout)).toHaveLength(1);
     });
 
+    it.each(["0", "1"])("rejects a reference-only solution with PROPHECY_NO_WORKER=%s", (noWorker) => {
+        const { stdout, stderr, exitCode } = runCli(
+            `--project ${path.join(FIXTURES, "project-references-solution")} --require-types --format json`,
+            { PROPHECY_NO_WORKER: noWorker },
+        );
+        expect(exitCode).toBe(2);
+        expect(stdout.trim()).toBe("");
+        expect(stderr).toContain("project references but no input files");
+        expect(stderr).toContain("separate --project arguments");
+    });
+
+    it("does not write a partial SAPP bundle when another root is reference-only", () => {
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), "prophecy-solution-output-"));
+        const outputDir = path.join(directory, "bundle");
+        const solution = path.join(FIXTURES, "project-references-solution");
+        try {
+            const result = runCli(
+                `--project ${path.join(solution, "app")} --project ${solution} --require-types ` +
+                    `--format sapp-json --output-dir ${outputDir}`,
+            );
+            expect(result.exitCode).toBe(2);
+            expect(result.stdout.trim()).toBe("");
+            expect(result.stderr).toContain("project references but no input files");
+            expect(fs.existsSync(outputDir)).toBe(false);
+        } finally {
+            fs.rmSync(directory, { recursive: true, force: true });
+        }
+    });
+
+    it("scans a referenced project directly with required declarations", () => {
+        const { stdout, exitCode } = runCli(
+            `--project ${path.join(FIXTURES, "project-references-solution", "app")} --require-types --format json`,
+        );
+        expect(exitCode).toBe(0);
+        expect(JSON.parse(stdout)).toHaveLength(1);
+    });
+
     it("reports TypeScript parser diagnostics for malformed tsconfig", () => {
         const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "prophecy-bad-jsonc-"));
         fs.writeFileSync(path.join(projectDir, "extension.ts"), "export function main() {}\n");
