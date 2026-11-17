@@ -309,6 +309,8 @@ interface SanitizerSpecBase {
     kind: SanitizerKind;
     /** Dot-separated API pattern to match. */
     pattern: string;
+    /** Require the standard library binding rather than a local or imported lookalike. */
+    globalBuiltin?: boolean;
     /** Human-readable description. */
     description: string;
 }

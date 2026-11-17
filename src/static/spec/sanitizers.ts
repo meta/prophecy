@@ -16,6 +16,7 @@ export const ParseIntSanitizer: SanitizerSpec = {
     kind: "callReturnValue",
     pattern: "parseInt",
     description: "Integer parsing removes string injection syntax",
+    globalBuiltin: true,
     numeric: true,
     categories: [...numericConversionCategories],
 };
@@ -24,6 +25,7 @@ export const NumberSanitizer: SanitizerSpec = {
     kind: "callReturnValue",
     pattern: "Number",
     description: "Number conversion removes string injection syntax",
+    globalBuiltin: true,
     numeric: true,
     categories: [...numericConversionCategories],
 };

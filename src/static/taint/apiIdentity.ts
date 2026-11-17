@@ -47,12 +47,28 @@ interface RegistrationState {
     writes: ReadonlyMap<ReceiverIdentity, ReadonlySet<string>>;
 }
 
+interface BuiltinFunctionUses {
+    sites: ts.Node[];
+    external: boolean;
+    unknown: boolean;
+}
+
+interface BuiltinReferences {
+    symbols: Map<ts.Symbol, ts.Expression[]>;
+    exported: Set<ts.Symbol>;
+    moduleCalls: ts.Node[];
+}
+
 /** Declaration facts belong to a checker, independent of the current taint state. */
 export class APIIdentityCache {
     private static caches = new WeakMap<ts.TypeChecker, APIIdentityCache>();
     readonly resolvedNames = new WeakMap<ts.Expression, string | undefined>();
     private importedNames = new WeakMap<ts.Expression, string | undefined>();
     private rawImportedNames = new WeakMap<ts.Expression, string | undefined>();
+    private builtinNames = new WeakMap<ts.Expression, string | undefined>();
+    private builtinWrites = new WeakMap<ts.SourceFile, { name: string; node: ts.Expression }[]>();
+    private builtinReferences = new WeakMap<ts.SourceFile, BuiltinReferences>();
+    private builtinUses = new WeakMap<ts.Node, BuiltinFunctionUses>();
     private registrationNames = new WeakMap<ts.Expression, string | undefined>();
     private accessNames = new WeakMap<ts.Expression, string>();
     private externalSymbols = new WeakMap<ts.Expression, boolean>();
@@ -179,6 +195,305 @@ export class APIIdentityCache {
             if (!new RegExp("^" + escaped.join("[^.]+") + "$").test(name)) return false;
         }
         return !this.registrationWasReplaced(expr, new Set());
+    }
+
+    /** Standard-library values through immutable aliases, resolved at each alias's capture site. */
+    builtinName(expr: ts.Expression): string | undefined {
+        if (this.builtinNames.has(expr)) return this.builtinNames.get(expr);
+        const name = this.resolveBuiltinName(expr, true, new Set());
+        this.builtinNames.set(expr, name);
+        return name;
+    }
+
+    private resolveBuiltinName(expr: ts.Expression, checkWrites: boolean, seen: Set<ts.Symbol>): string | undefined {
+        const value = unwrapExpression(expr);
+        let name: string | undefined;
+        if (ts.isIdentifier(value)) {
+            const symbol = this.checker.getSymbolAtLocation(value);
+            if (value.text === "globalThis" && symbol?.getName() === "globalThis" && !symbol.declarations?.length) {
+                name = "globalThis";
+            } else if (symbol?.declarations?.some((decl) => decl.getSourceFile().hasNoDefaultLib)) {
+                name = value.text;
+            } else {
+                if (!symbol || seen.has(symbol)) return undefined;
+                seen.add(symbol);
+                const declaration = symbol.valueDeclaration;
+                if (
+                    !declaration ||
+                    !ts.isVariableDeclaration(declaration) ||
+                    !declaration.initializer ||
+                    !ts.isVariableDeclarationList(declaration.parent) ||
+                    (checkWrites && (declaration.parent.flags & ts.NodeFlags.Const) === 0)
+                )
+                    return undefined;
+                // Later writes to the original binding do not change a captured function value.
+                return this.resolveBuiltinName(declaration.initializer, checkWrites, seen);
+            }
+        } else {
+            const member = this.registrationMember(value);
+            if (!member) return undefined;
+            const receiver = this.resolveBuiltinName(member.receiver, checkWrites, seen);
+            if (receiver == null) return undefined;
+            const symbol = this.checker.getTypeAtLocation(unwrapExpression(member.receiver)).getProperty(member.name);
+            if (checkWrites && !symbol?.declarations?.some((decl) => decl.getSourceFile().hasNoDefaultLib)) {
+                return undefined;
+            }
+            const global = symbol?.declarations?.find(
+                (decl): decl is ts.VariableDeclaration | ts.FunctionDeclaration =>
+                    decl.getSourceFile().hasNoDefaultLib &&
+                    (ts.isVariableDeclaration(decl) || ts.isFunctionDeclaration(decl)) &&
+                    ts.findAncestor(decl, ts.isModuleDeclaration) == null,
+            );
+            name =
+                global?.name && ts.isIdentifier(global.name)
+                    ? global.name.text
+                    : receiver === "globalThis"
+                      ? member.name
+                      : `${receiver}.${member.name}`;
+        }
+        if (checkWrites && this.builtinWasWritten(name, value)) return undefined;
+        return name;
+    }
+
+    private builtinWasWritten(name: string, read: ts.Expression): boolean {
+        const source = read.getSourceFile();
+        let writes = this.builtinWrites.get(source);
+        if (!writes) {
+            writes = [];
+            this.builtinWrites.set(source, writes);
+            const visit = (node: ts.Node): void => {
+                let target: ts.Expression | undefined;
+                if (
+                    ts.isBinaryExpression(node) &&
+                    node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+                    node.operatorToken.kind <= ts.SyntaxKind.LastAssignment
+                )
+                    target = node.left;
+                else if (ts.isDeleteExpression(node)) target = node.expression;
+                else if (
+                    (ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
+                    (node.operator === ts.SyntaxKind.PlusPlusToken || node.operator === ts.SyntaxKind.MinusMinusToken)
+                )
+                    target = node.operand;
+                if (target) {
+                    const value = unwrapExpression(target);
+                    // Assigning a local alias is not a write to the global it once held.
+                    const directGlobal =
+                        !ts.isIdentifier(value) ||
+                        this.checker
+                            .getSymbolAtLocation(value)
+                            ?.declarations?.some((decl) => decl.getSourceFile().hasNoDefaultLib);
+                    const written = directGlobal ? this.resolveBuiltinName(value, false, new Set()) : undefined;
+                    if (written != null) writes!.push({ name: written, node: node as ts.Expression });
+                }
+                ts.forEachChild(node, visit);
+            };
+            visit(source);
+        }
+        const scope = this.builtinExecutionScope(read);
+        return writes.some((write) => {
+            if (write.name !== name) return false;
+            const writeScope = this.builtinExecutionScope(write.node);
+            if (writeScope === scope) return this.builtinEventBefore(write.node, read);
+            if (ts.isSourceFile(writeScope)) return true;
+            return this.builtinScopeRunsBefore(writeScope, read);
+        });
+    }
+
+    private builtinExecutionScope(node: ts.Node): ts.Node {
+        return (
+            ts.findAncestor(node.parent, (parent) => ts.isFunctionLike(parent) || ts.isSourceFile(parent)) ??
+            node.getSourceFile()
+        );
+    }
+
+    private builtinEventBefore(event: ts.Node, read: ts.Expression): boolean {
+        // Assignment and invocation effects happen after their operands/arguments, not at the callee or LHS token.
+        if (event.end <= read.pos) return true;
+        return (
+            ts.findAncestor(
+                event,
+                (node) => ts.isIterationStatement(node, false) && node.pos <= read.pos && node.end >= read.end,
+            ) != null
+        );
+    }
+
+    private builtinScopeRunsBefore(scope: ts.Node, read: ts.Expression): boolean {
+        const pending = [scope];
+        const seen = new Set<ts.Node>();
+        const readingScope = this.builtinExecutionScope(read);
+        while (pending.length) {
+            const current = pending.pop()!;
+            // Shared callers and recursive edges must not expand into every possible call path.
+            if (seen.has(current)) continue;
+            seen.add(current);
+            const uses = this.builtinFunctionUses(current);
+            if (uses.unknown) return true;
+            if (uses.external) {
+                if (!ts.isSourceFile(readingScope)) return true;
+                // External entry calls follow module initialization unless initialization itself can reenter.
+                if (
+                    this.builtinReferenceIndex(readingScope).moduleCalls.some((call) =>
+                        this.builtinEventBefore(call, read),
+                    )
+                ) {
+                    return true;
+                }
+            }
+            for (const site of uses.sites) {
+                const caller = this.builtinExecutionScope(site);
+                if (caller === readingScope) {
+                    if (this.builtinEventBefore(site, read)) return true;
+                } else if (ts.isSourceFile(caller)) {
+                    return true;
+                } else {
+                    pending.push(caller);
+                }
+            }
+        }
+        return false;
+    }
+
+    private builtinOuterExpression(expr: ts.Expression): ts.Expression {
+        let value = expr;
+        while (value.parent && ts.isExpression(value.parent) && unwrapExpression(value.parent) === expr) {
+            value = value.parent;
+        }
+        return value;
+    }
+
+    private builtinActivationSite(expr: ts.Expression): ts.Node {
+        const value = this.builtinOuterExpression(expr);
+        const parent = value.parent;
+        return ts.isCallExpression(parent) || ts.isNewExpression(parent) || ts.isTaggedTemplateExpression(parent)
+            ? parent
+            : value;
+    }
+
+    private builtinFunctionUses(scope: ts.Node): BuiltinFunctionUses {
+        const cached = this.builtinUses.get(scope);
+        if (cached) return cached;
+        const uses: BuiltinFunctionUses = { sites: [], external: false, unknown: false };
+        this.builtinUses.set(scope, uses);
+        const source = scope.getSourceFile();
+        const references = this.builtinReferenceIndex(source);
+        const seen = new Set<ts.Symbol>();
+        const binding = (symbol: ts.Symbol | undefined): void => {
+            if (!symbol) {
+                uses.unknown = true;
+                return;
+            }
+            if (seen.has(symbol)) return;
+            seen.add(symbol);
+            uses.external ||=
+                references.exported.has(symbol) ||
+                symbol.declarations?.some(
+                    (declaration) =>
+                        (ts.getCombinedModifierFlags(declaration) &
+                            (ts.ModifierFlags.Export | ts.ModifierFlags.Default)) !==
+                        0,
+                ) === true;
+            for (const ref of references.symbols.get(symbol) ?? []) {
+                const parent = ref.parent;
+                if (
+                    (ts.isFunctionDeclaration(parent) ||
+                        ts.isFunctionExpression(parent) ||
+                        ts.isVariableDeclaration(parent) ||
+                        ts.isBindingElement(parent) ||
+                        ts.isImportSpecifier(parent) ||
+                        ts.isImportClause(parent) ||
+                        ts.isNamespaceImport(parent)) &&
+                    parent.name === ref
+                )
+                    continue;
+                if (ts.isExportSpecifier(parent) || ts.isExportAssignment(parent)) {
+                    uses.external = true;
+                    continue;
+                }
+                const value = this.builtinOuterExpression(
+                    ts.isPropertyAccessExpression(parent) && parent.name === ref ? parent : ref,
+                );
+                const owner = value.parent;
+                if (
+                    ts.isVariableDeclaration(owner) &&
+                    owner.initializer === value &&
+                    ts.isIdentifier(owner.name) &&
+                    ts.isVariableDeclarationList(owner.parent) &&
+                    (owner.parent.flags & ts.NodeFlags.Const) !== 0
+                ) {
+                    binding(this.checker.getSymbolAtLocation(owner.name));
+                } else {
+                    // Escapes to unknown code are possible invocations from that point onward.
+                    uses.sites.push(this.builtinActivationSite(value));
+                }
+            }
+        };
+        if (ts.isFunctionDeclaration(scope)) {
+            if (scope.name) binding(this.checker.getSymbolAtLocation(scope.name));
+            else
+                uses.external =
+                    (ts.getCombinedModifierFlags(scope) & (ts.ModifierFlags.Export | ts.ModifierFlags.Default)) !== 0;
+            uses.external ||= scope.parent === source && !ts.isExternalModule(source);
+            uses.unknown ||= !scope.name && !uses.external;
+        } else if (ts.isArrowFunction(scope) || ts.isFunctionExpression(scope)) {
+            const value = this.builtinOuterExpression(scope);
+            const parent = value.parent;
+            if (ts.isVariableDeclaration(parent)) {
+                if (
+                    ts.isIdentifier(parent.name) &&
+                    ts.isVariableDeclarationList(parent.parent) &&
+                    (parent.parent.flags & ts.NodeFlags.Const) !== 0
+                )
+                    binding(this.checker.getSymbolAtLocation(parent.name));
+                else uses.unknown = true;
+            } else {
+                uses.sites.push(this.builtinActivationSite(value));
+            }
+            if (ts.isFunctionExpression(scope) && scope.name) binding(this.checker.getSymbolAtLocation(scope.name));
+        } else {
+            uses.unknown = true;
+        }
+        return uses;
+    }
+
+    private builtinReferenceIndex(source: ts.SourceFile): BuiltinReferences {
+        const cached = this.builtinReferences.get(source);
+        if (cached) return cached;
+        const index: BuiltinReferences = { symbols: new Map(), exported: new Set(), moduleCalls: [] };
+        this.builtinReferences.set(source, index);
+        const canonical = (symbol: ts.Symbol): ts.Symbol =>
+            symbol.flags & ts.SymbolFlags.Alias ? this.checker.getAliasedSymbol(symbol) : symbol;
+        const module = this.checker.getSymbolAtLocation(source);
+        if (module) for (const symbol of this.checker.getExportsOfModule(module)) index.exported.add(canonical(symbol));
+        const visit = (node: ts.Node): void => {
+            if (ts.isTypeNode(node)) return;
+            if (
+                (ts.isCallExpression(node) || ts.isNewExpression(node) || ts.isTaggedTemplateExpression(node)) &&
+                this.builtinExecutionScope(node) === source
+            )
+                index.moduleCalls.push(node);
+            if (
+                ts.isIdentifier(node) ||
+                (ts.isElementAccessExpression(node) && ts.isStringLiteralLike(node.argumentExpression))
+            ) {
+                const symbol = ts.isElementAccessExpression(node)
+                    ? this.checker
+                          .getTypeAtLocation(node.expression)
+                          .getProperty((node.argumentExpression as ts.StringLiteralLike).text)
+                    : ts.isShorthandPropertyAssignment(node.parent)
+                      ? this.checker.getShorthandAssignmentValueSymbol(node.parent)
+                      : this.checker.getSymbolAtLocation(node);
+                if (symbol) {
+                    const key = canonical(symbol);
+                    const refs = index.symbols.get(key) ?? [];
+                    refs.push(node);
+                    index.symbols.set(key, refs);
+                }
+            }
+            ts.forEachChild(node, visit);
+        };
+        visit(source);
+        return index;
     }
 
     registrationMatches(expr: ts.Expression, pattern: string): boolean {

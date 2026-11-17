@@ -3845,6 +3845,8 @@ export class TaintTracker {
             !calleeBeforeArguments && ts.isIdentifier(callee)
                 ? resolveFunctionReference(this.checker, callee)
                 : undefined;
+        // Sanitizer identity belongs to the selected callee, not to bindings after argument effects.
+        const sanitizer = this.matchingSanitizer(expr);
         const evaluatedArguments: { value?: CallArgument[] } = {};
         const hostResult = this.analyzeHostCall(expr, state, receiverTaints, evaluatedArguments);
         if (hostResult) return hostResult.taints;
@@ -3919,7 +3921,6 @@ export class TaintTracker {
             this.analyzeSynchronousForEachCallback(expr, synchronousForEachCallback, state, receiverTaints);
         }
 
-        const sanitizer = this.matchingSanitizer(expr);
         if (sanitizer != null) {
             const inputTaints = argTaints.filter((taints): taints is TaintValue[] => taints != null).flat();
             if (inputTaints.length === 0) return undefined;
@@ -7025,6 +7026,11 @@ export class TaintTracker {
     private sanitizerForCallee(callee: ts.Expression): SanitizerSpec | undefined {
         const callName = getCallChainName(callee);
         for (const sanitizer of this.spec.sanitizers) {
+            if (sanitizer.globalBuiltin) {
+                const builtin = this.apiIdentity.builtinName(callee);
+                if (builtin != null && this.matchesResolved(builtin, sanitizer.pattern)) return sanitizer;
+                continue;
+            }
             if (this.matchesPatternWithExpr(callee, callName, sanitizer.pattern, `sanitizer.${sanitizer.kind}`)) {
                 return sanitizer;
             }
