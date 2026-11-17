@@ -15,6 +15,8 @@ export function formatFindingsLint(
     fileContents: Map<string, string>,
     pathBase?: string,
     specOverrides?: FixStrategyProvider,
+    /** All findings were passed to generateFixes with these same contents and overrides. */
+    options?: { fixesGenerated?: boolean },
 ): string {
     if (findings.length === 0) return "";
 
@@ -32,7 +34,8 @@ export function formatFindingsLint(
         const category = finding.sink.categories[0];
         const overrides = typeof specOverrides === "function" ? specOverrides(finding) : specOverrides;
         const strategy = resolveFixStrategy(finding.sink, overrides);
-        const fix = finding.fix ?? generateFix(finding, fileContents, overrides);
+        const fix =
+            finding.fix ?? (options?.fixesGenerated ? undefined : generateFix(finding, fileContents, overrides));
 
         const filePath = pathBase
             ? path.relative(pathBase, finding.sinkLocation.fileName)

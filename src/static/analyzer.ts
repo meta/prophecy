@@ -406,7 +406,9 @@ async function analyzeWithMetrics(
         const fixCount = generateFixes(deduped, fileContents, spec.fixStrategies);
         report(`generated ${fixCount} fixes in ${elapsedSecs(fixStart)}s`);
         if (options.outputFormat === "lint") {
-            formattedOutput = formatFindingsLint(deduped, fileContents, options.projectDir, spec.fixStrategies);
+            formattedOutput = formatFindingsLint(deduped, fileContents, options.projectDir, spec.fixStrategies, {
+                fixesGenerated: true,
+            });
         } else {
             // index.ts streams the SAPP rows from findings and sappRepoRoot;
             // do not allocate the entire NDJSON bundle as one string here.

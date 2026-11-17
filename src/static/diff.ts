@@ -190,7 +190,9 @@ async function formatOutput(
         }
         generateFixes(findings, fileContents, (finding) => getSpec(finding).fixStrategies);
         if (outputFormat === "lint") {
-            return formatFindingsLint(findings, fileContents, repoRoot, (finding) => getSpec(finding).fixStrategies);
+            return formatFindingsLint(findings, fileContents, repoRoot, (finding) => getSpec(finding).fixStrategies, {
+                fixesGenerated: true,
+            });
         }
 
         // SAPP output is streamed by index.ts from the mutated findings; this
