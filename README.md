@@ -101,6 +101,11 @@ If no config is found in the project or its ancestors, it collects `.ts` and
 reduce matching accuracy. `--require-types` fails on unresolved Node built-in
 imports and missing `tsconfig` type libraries; it is not a complete type check.
 
+Invalid or unreadable project configs, unresolved `extends` configs, and missing
+files explicitly listed in a config are errors. An empty input set is accepted
+with a warning on stderr and in the library result's `warnings`; check that the
+config selected the files you intended to analyze.
+
 To try a bundled fixture, which passes `uri.query` to `child_process.exec`:
 
 ```text
@@ -408,13 +413,13 @@ bundle.
 | `--sapp-project`       | Project name in SAPP runner metadata                                                                        | First project's package/directory name |
 | `--sapp-commit`        | Revision in SAPP runner metadata                                                                            | Sapling revision, when available       |
 | `--exclude`            | Repeatable path substring; drops source files whose resolved path contains it (`String.prototype.includes`) | —                                      |
-| `--shard-index`        | Zero-based process shard index                                                                              | `0`                                    |
-| `--shard-count`        | Number of process shards                                                                                    | `1`                                    |
+| `--shard-index`        | Zero-based integer process shard index; must be below `--shard-count`                                       | `0`                                    |
+| `--shard-count`        | Number of process shards; positive safe integer                                                             | `1`                                    |
 | `--entry-point-filter` | Debugging: repeatable substring of an entry point's `file:line`                                             | —                                      |
 | `--require-types`      | Fail on detected missing type declarations                                                                  | `false`                                |
 | `--progress-log`       | File to append phase/progress lines to in `json`, `lint`, and `sapp-json` modes                             | —                                      |
 | `--repo-root`          | Root for relative SAPP paths and patch screening; code links when supported                                 | See below                              |
-| `--max-depth`          | Maximum interprocedural call depth                                                                          | `5`                                    |
+| `--max-depth`          | Maximum interprocedural call depth; nonnegative safe integer                                                | `5`                                    |
 | `--analysis-stats`     | Print pattern-matching counts, type-resolved versus heuristic                                               | `false`                                |
 | `--analysis-debug`     | Print structured JSON about analyzer matching decisions                                                     | `false`                                |
 
@@ -424,8 +429,10 @@ Exclusions, sharding, and entry-point filters apply to project mode, not patch
 screening.
 
 Exit 0 means the scan finished, with or without findings; it does not imply
-complete coverage. Exit 1 covers handled input, syntax, and bundle-merge errors.
-Exit 2 covers exceptions, including `--require-types` failures.
+complete coverage or that any source inputs were selected. Exit 1 covers handled
+input, project-configuration, syntax, and bundle-merge errors.
+Exit 2 covers exceptions, including unsupported reference-only solution configs
+and `--require-types` failures.
 
 ### Patch screening
 
@@ -438,6 +445,11 @@ the revision you want to scan. Prophecy analyzes projects containing changed
 TypeScript files, then retains findings whose source, sink, or propagation
 trace touches a changed file. It does not restrict analysis to changed lines
 or compare parent and patched findings.
+
+Changed TypeScript paths must refer to existing files inside `--repo-root`.
+Project selection uses the nearest ancestor `tsconfig.json` within that root,
+then the nearest `package.json`. Without either, it analyzes the changed file's
+containing directory; resolved imports can bring in files from other directories.
 
 ### SAPP output and sharding
 
@@ -533,6 +545,10 @@ severity, and presentation groups.
 
 See the [development guide](docs/development.md) for test commands, adding
 patterns, fixture expectations, and internal integration conventions.
+
+## Security
+
+For vulnerability reporting, see [SECURITY.md](SECURITY.md).
 
 ## License
 

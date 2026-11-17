@@ -15,6 +15,7 @@ const root = path.resolve(__dirname, "../..");
 const readme = fs.readFileSync(path.join(root, "README.md"), "utf8");
 const documents = [
     "README.md",
+    "SECURITY.md",
     "docs/development.md",
     "docs/framework-models.md",
     "docs/precision-reporting.md",

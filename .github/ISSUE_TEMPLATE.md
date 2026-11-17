@@ -1,6 +1,9 @@
 <!-- Use a minimal synthetic example or public code. Do not include credentials,
 private source code, or exploitable vulnerabilities in Prophecy or other projects. -->
 
+For security vulnerabilities, use the [Meta Bug Bounty program](https://bugbounty.meta.com/).
+See [SECURITY.md](../SECURITY.md) for the reporting policy.
+
 ## Problem
 
 Describe the bug, false positive, false negative, or feature request.

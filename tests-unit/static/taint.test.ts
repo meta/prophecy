@@ -488,14 +488,14 @@ describe("Static Taint Analysis", () => {
                         handleUri(uri: vscode.Uri) {
                             const escaped = shlex.quote(uri.query);
                             const terminal = vscode.window.createTerminal("Agent");
-                            terminal.sendText("hyperloop_client -job_id " + escaped);
-                            terminal.sendText(\`/irnext-debugger:debug-logs Analyze \${escaped}\`);
+                            terminal.sendText("demo_client -job_id " + escaped);
+                            terminal.sendText(\`/demo-debugger:debug-logs Analyze \${escaped}\`);
                         }
                     });
                 }
             `);
 
-            expect(quotedArgumentCommands(result.findings)).toEqual(["hyperloop_client", "irnext-debugger:debug-logs"]);
+            expect(quotedArgumentCommands(result.findings)).toEqual(["demo-debugger:debug-logs", "demo_client"]);
             expect(result.findings).toHaveLength(2);
         });
 
@@ -712,7 +712,7 @@ describe("Static Taint Analysis", () => {
                 import * as shlex from "shlex";
                 import * as vscode from "vscode";
 
-                const COMMAND = "/irnext-debugger:debug-logs";
+                const COMMAND = "/demo-debugger:debug-logs";
                 const ALIAS = COMMAND;
 
                 export function activate() {
@@ -730,7 +730,7 @@ describe("Static Taint Analysis", () => {
             // Resolving the prefix makes each quoted value an argument of the slash
             // command (argument injection) rather than unknown shell text (rce).
             expect(result.findings).toHaveLength(2);
-            expect(new Set(quotedArgumentCommands(result.findings))).toEqual(new Set(["irnext-debugger:debug-logs"]));
+            expect(new Set(quotedArgumentCommands(result.findings))).toEqual(new Set(["demo-debugger:debug-logs"]));
             expect(quotedArgumentCommands(result.findings)).toHaveLength(result.findings.length);
         });
 
@@ -771,7 +771,7 @@ describe("Static Taint Analysis", () => {
                             const line = Number(uri.fragment);
                             const escaped = shlex.quote(uri.query);
                             const terminal = vscode.window.createTerminal("Agent");
-                            terminal.sendText(\`/irnext-debugger:debug-logs Line \${line} of \${escaped}\`);
+                            terminal.sendText(\`/demo-debugger:debug-logs Line \${line} of \${escaped}\`);
                             terminal.sendText("agent show --line " + parseInt(uri.path, 10) + " " + escaped);
                         }
                     });
@@ -782,7 +782,7 @@ describe("Static Taint Analysis", () => {
             // command (argument injection) rather than unknown shell text (rce).
             expect(result.findings).toHaveLength(2);
             expect(new Set(quotedArgumentCommands(result.findings))).toEqual(
-                new Set(["agent", "irnext-debugger:debug-logs"]),
+                new Set(["agent", "demo-debugger:debug-logs"]),
             );
             expect(quotedArgumentCommands(result.findings)).toHaveLength(result.findings.length);
         });

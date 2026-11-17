@@ -2,7 +2,7 @@
   "$schema": "./node_modules/oxfmt/configuration_schema.json",
   "printWidth": 120,
   "tabWidth": 4,
-  // Keep the key order that Yarn writes.
+  // Keep related package manifest fields together.
   "sortPackageJson": false,
   "ignorePatterns": [
     "dist/",

@@ -17,7 +17,8 @@ The Express preset includes scoped Node HTTP/HTTPS server request models.
 These models do not claim complete framework coverage or establish a
 framework's entire lifecycle, authentication, or middleware ordering.
 
-`auto` chooses one preset per root, in this order: VS Code, Electron, Express.
+`auto` chooses one preset per root, in this order: ISL package names, VS Code,
+Electron, Express.
 Unrecognized metadata retains the VS Code fallback. Use `--preset` for an
 explicit selection or `--spec` for a composed model.
 
