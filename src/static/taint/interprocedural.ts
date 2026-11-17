@@ -1026,16 +1026,18 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
                         .join(",");
                     const handlerArgTaints = bound.taints;
                     const handlerArgInstances = bound.instances;
-                    const cacheKey = this.getCallCacheKey(
-                        handler,
-                        handlerArgTaints,
-                        enclosingState,
-                        `${this.functionArgumentsCacheKey(handlerArgInstances)}#defaults:${defaultsKey}`,
-                    );
                     const useCache =
                         !this.usedModuleInstances &&
                         handlerArgInstances.every((instance) => this.isCacheableArgumentInstance(instance));
-                    const cached = useCache ? this.cachedCallResult(cacheKey, depth) : undefined;
+                    const cacheKey = useCache
+                        ? this.getCallCacheKey(
+                              handler,
+                              handlerArgTaints,
+                              enclosingState,
+                              `${this.functionArgumentsCacheKey(handlerArgInstances)}#defaults:${defaultsKey}`,
+                          )
+                        : undefined;
+                    const cached = cacheKey !== undefined ? this.cachedCallResult(cacheKey, depth) : undefined;
                     if (cached) {
                         this.cacheHits++;
                         return {
@@ -1100,7 +1102,12 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
                     const instanceState = mergeReturnInstances(result.returnInstances, result.returnInstanceUnknown);
                     const fieldState = this.extractInstanceFieldState(result.finalState);
                     const clearedFieldSymbols = this.clearedFieldSymbols(inheritedFieldState, fieldState);
-                    if (useCache && !this.usedModuleInstances && !instanceState && !result.throwInstances?.length) {
+                    if (
+                        cacheKey !== undefined &&
+                        !this.usedModuleInstances &&
+                        !instanceState &&
+                        !result.throwInstances?.length
+                    ) {
                         this.setCachedCallResult(cacheKey, {
                             returnTaints,
                             returnUnknown: result.returnUnknown,
@@ -1210,18 +1217,20 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
             .map(({ parameter, conditional }) => `${params.indexOf(parameter)}:${conditional ? "maybe" : "always"}`)
             .join(",");
         const funcArgTaints = params.map((_, i) => argTaints[i]);
-        const cacheKey = this.getCallCacheKey(
-            funcDecl,
-            funcArgTaints,
-            enclosingState,
-            `${this.functionArgumentsCacheKey(argInstances)}#defaults:${defaultsKey}`,
-        );
         const useCache =
             !this.usedModuleInstances &&
             calleeReceiver == null &&
             (boundFunction == null || boundFunction.capturedInstances.size === 0) &&
             argInstances.every((instance) => this.isCacheableArgumentInstance(instance));
-        const cached = useCache ? this.cachedCallResult(cacheKey, depth) : undefined;
+        const cacheKey = useCache
+            ? this.getCallCacheKey(
+                  funcDecl,
+                  funcArgTaints,
+                  enclosingState,
+                  `${this.functionArgumentsCacheKey(argInstances)}#defaults:${defaultsKey}`,
+              )
+            : undefined;
+        const cached = cacheKey !== undefined ? this.cachedCallResult(cacheKey, depth) : undefined;
         if (cached) {
             this.cacheHits++;
             return {
@@ -1318,7 +1327,7 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
         const instanceState = mergeReturnInstances(result.returnInstances, result.returnInstanceUnknown);
         const fieldState = this.extractInstanceFieldState(result.finalState);
         const clearedFieldSymbols = this.clearedFieldSymbols(inheritedFieldState, fieldState);
-        if (useCache && !this.usedModuleInstances && !instanceState && !result.throwInstances?.length) {
+        if (cacheKey !== undefined && !this.usedModuleInstances && !instanceState && !result.throwInstances?.length) {
             this.setCachedCallResult(cacheKey, {
                 returnTaints,
                 returnUnknown: result.returnUnknown,
