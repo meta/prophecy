@@ -239,6 +239,8 @@ export interface SinkSpec {
      */
     argumentShapes?: Record<number, "array" | "object" | "string">;
     rejectUnknownArgumentShapes?: boolean;
+    /** JSON body shapes stay candidates after custom headers or an unknown response handoff. */
+    jsonResponseBody?: true;
     /**
      * A nonnegative literal integer fd (or immutable scalar alias) in this
      * options property overrides the path argument. Unknown, null, or

@@ -26,6 +26,7 @@ import {
     withSanitizers,
 } from "./taintValue";
 import { getLocationString } from "../parser";
+import { NumberSanitizer } from "../spec/sanitizers";
 import {
     getCallChainName,
     parameterSymbol,
@@ -44,6 +45,9 @@ import {
     axiosInheritedDestinationTaints,
     axiosRequestConfigIndex,
     hasKnownFileDescriptor,
+    isBuiltinCollectionCardinality,
+    hasCustomResponseHandling,
+    isConstructedJsonBody,
 } from "./nodeApiModels";
 
 /**
@@ -71,6 +75,10 @@ function createTaintState(): CopyOnWriteMap<ts.Symbol, readonly TaintValue[]> {
 // Bound pathological loops while allowing substantially deeper propagation
 // than the analyzer's interprocedural depth limit.
 const MAX_LOOP_ITERATIONS = 16;
+const CollectionCardinalitySanitizer: SanitizerSpec = {
+    ...NumberSanitizer,
+    categories: ["xss", "code_injection", "ssti"],
+};
 
 // Binding metadata is boxed in reserved slots so container iteration cannot consume it.
 const BINDING_PROPERTY = "$property:";
@@ -2866,16 +2874,6 @@ export class TaintTracker {
         if (ts.isArrayLiteralExpression(value)) return "array";
         if (ts.isObjectLiteralExpression(value)) return "object";
 
-        if (ts.isIdentifier(value)) {
-            const symbol = this.resolveSymbol(value);
-            const declaration = symbol?.valueDeclaration;
-            if (declaration != null && ts.isVariableDeclaration(declaration) && declaration.initializer != null) {
-                const initializer = unwrapExpression(declaration.initializer);
-                if (ts.isArrayLiteralExpression(initializer)) return "array";
-                if (ts.isObjectLiteralExpression(initializer)) return "object";
-            }
-        }
-
         const type = this.checker.getNonNullableType(this.checker.getTypeAtLocation(value));
         const members = type.isUnion() ? type.types : [type];
         let shape: "array" | "object" | "string" | undefined;
@@ -2906,10 +2904,22 @@ export class TaintTracker {
         return true;
     }
 
-    private sinkAcceptsArgument(sink: SinkSpec, position: number, argument: ts.Expression): boolean {
+    private sinkAcceptsArgument(
+        sink: SinkSpec,
+        position: number,
+        argument: ts.Expression,
+        call?: ts.CallExpression,
+    ): boolean {
         const expected = sink.argumentShapes?.[position];
         if (expected == null) return true;
         const actual = this.argumentShape(argument);
+        if (
+            sink.jsonResponseBody &&
+            (actual === "object" || actual === "array") &&
+            call &&
+            (!isConstructedJsonBody(argument, this.checker) || hasCustomResponseHandling(call, this.checker))
+        )
+            return true;
         return actual == null ? sink.rejectUnknownArgumentShapes !== true : actual === expected;
     }
 
@@ -2956,6 +2966,12 @@ export class TaintTracker {
         if (stringField) return stringField.valueTaints?.slice();
         const ownFieldTaints = this.getInstanceFieldTaint(expr);
         if (ownFieldTaints) return ownFieldTaints;
+        if (isBuiltinCollectionCardinality(expr, this.checker)) {
+            const taints = objectTaints && TaintTracker.taintsForProperty(objectTaints, expr.name.text);
+            return taints?.length
+                ? this.applySanitizer(taints, CollectionCardinalitySanitizer, expr, "numeric collection cardinality")
+                : undefined;
+        }
         if (expr.name.text === "length" && this.hasHostType(this.resolveInstance(expr.expression), "Array")) {
             const length = this.resolveInstance(expr.expression)!.elementInstances.get("$sortLength")?.valueTaints;
             return length?.length
@@ -7574,7 +7590,7 @@ export class TaintTracker {
             // Executable argv operands and shell-enabled arguments carry code.
             for (const pos of positions) {
                 if (pos < taints.length && taints[pos]) {
-                    if (!this.sinkAcceptsArgument(sink, pos, args[pos])) {
+                    if (!this.sinkAcceptsArgument(sink, pos, args[pos], expr)) {
                         continue;
                     }
                     for (const taint of taints[pos]!) {
@@ -7815,7 +7831,7 @@ export class TaintTracker {
     private applySanitizer(
         taints: readonly TaintValue[],
         sanitizer: SanitizerSpec,
-        expr: ts.CallExpression,
+        expr: ts.Expression,
         description: string,
         elementWise = false,
     ): TaintValue[] {

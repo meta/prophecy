@@ -35,6 +35,7 @@ export function canonicalModuleApiName(name: string): string {
         .replace(/^node:/, "")
         .replace(/^fs-extra(?=\.)/, "fs")
         .replace(/^fs[/.]promises\./, "fs.")
+        .replace(/^(?:node-fetch(?:\.default)?|undici\.fetch)$/, "fetch")
         .replace(/^(?:.*\/node_modules\/@types\/)?express(?:-serve-static-core)?(?:\/index)?\./, "express.")
         .replace(/^vscode-languageclient\/node\./, "vscode-languageclient.");
 }
@@ -66,6 +67,8 @@ export class APIIdentityCache {
     private importedNames = new WeakMap<ts.Expression, string | undefined>();
     private rawImportedNames = new WeakMap<ts.Expression, string | undefined>();
     private builtinNames = new WeakMap<ts.Expression, string | undefined>();
+    private builtinCandidates = new WeakMap<ts.Expression, string | undefined>();
+    private fetchCallables = new WeakMap<ts.Expression, boolean>();
     private builtinWrites = new WeakMap<ts.SourceFile, { name: string; node: ts.Expression }[]>();
     private builtinReferences = new WeakMap<ts.SourceFile, BuiltinReferences>();
     private builtinUses = new WeakMap<ts.Node, BuiltinFunctionUses>();
@@ -185,9 +188,16 @@ export class APIIdentityCache {
 
     /** Identity for opt-in API rules; unknown or locally shadowed names do not match. */
     matchesAPI(expr: ts.Expression, pattern: string): boolean {
+        const expected = canonicalModuleApiName(pattern);
+        if (expected === "fetch") {
+            if (!this.builtinCandidates.has(expr)) {
+                this.builtinCandidates.set(expr, this.resolveBuiltinName(expr, false, new Set()));
+            }
+            if (this.builtinCandidates.get(expr) === "fetch") return this.builtinName(expr) === "fetch";
+            if (this.fetchCallableContract(expr)) return true;
+        }
         const name = this.registrationName(expr);
         if (name == null) return false;
-        const expected = canonicalModuleApiName(pattern);
         if (!expected.includes("*")) {
             if (name !== expected) return false;
         } else {
@@ -195,6 +205,63 @@ export class APIIdentityCache {
             if (!new RegExp("^" + escaped.join("[^.]+") + "$").test(name)) return false;
         }
         return !this.registrationWasReplaced(expr, new Set());
+    }
+
+    private fetchCallableContract(expr: ts.Expression): boolean {
+        const cached = this.fetchCallables.get(expr);
+        if (cached != null) return cached;
+        const nativeType = (type: ts.Type, name: string): boolean => {
+            const symbol = type.getSymbol() ?? type.aliasSymbol;
+            if (symbol?.getName() !== name) return false;
+            return (
+                symbol.declarations?.some((declaration) => {
+                    const file = declaration.getSourceFile();
+                    if (!file.isDeclarationFile) return false;
+                    if (file.hasNoDefaultLib) return true;
+                    if (
+                        /\/node_modules\/(?:@types\/)?(?:node-fetch|undici|undici-types)\//.test(
+                            file.fileName.replace(/\\/g, "/"),
+                        )
+                    )
+                        return true;
+                    if (file.fileName.replace(/\\/g, "/").endsWith("/@types/node/web-globals/fetch.d.ts")) return true;
+                    return (
+                        ts.findAncestor(
+                            declaration,
+                            (node) =>
+                                ts.isModuleDeclaration(node) &&
+                                ts.isStringLiteral(node.name) &&
+                                ["node-fetch", "undici", "undici-types"].includes(node.name.text),
+                        ) != null
+                    );
+                }) === true
+            );
+        };
+        const matches = this.checker
+            .getSignaturesOfType(this.checker.getTypeAtLocation(expr), ts.SignatureKind.Call)
+            .some((signature) => {
+                const parameter = signature.parameters[0];
+                if (!parameter) return false;
+                const result = this.checker.getReturnTypeOfSignature(signature);
+                const promise = result.getSymbol();
+                if (
+                    promise?.getName() !== "Promise" ||
+                    !promise.declarations?.some((declaration) => declaration.getSourceFile().hasNoDefaultLib)
+                )
+                    return false;
+                const response = this.checker.getTypeArguments(result as ts.TypeReference)[0];
+                if (!response || !nativeType(response, "Response")) return false;
+                const input = this.checker.getTypeOfSymbolAtLocation(parameter, expr);
+                const alternatives = input.isUnion() ? input.types : [input];
+                return alternatives.some(
+                    (type) =>
+                        (type.flags & ts.TypeFlags.StringLike) !== 0 ||
+                        nativeType(type, "Request") ||
+                        nativeType(type, "URL"),
+                );
+            });
+        this.fetchCallables.set(expr, matches);
+        return matches;
     }
 
     /** Standard-library values through immutable aliases, resolved at each alias's capture site. */
@@ -205,6 +272,14 @@ export class APIIdentityCache {
         return name;
     }
 
+    hasBuiltinWrite(name: string, read: ts.Expression): boolean {
+        return this.builtinWasWritten(name, read);
+    }
+
+    hasPropertyWrite(read: ts.Expression): boolean {
+        return this.registrationWasReplaced(read, new Set());
+    }
+
     private resolveBuiltinName(expr: ts.Expression, checkWrites: boolean, seen: Set<ts.Symbol>): string | undefined {
         const value = unwrapExpression(expr);
         let name: string | undefined;
@@ -212,8 +287,8 @@ export class APIIdentityCache {
             const symbol = this.checker.getSymbolAtLocation(value);
             if (value.text === "globalThis" && symbol?.getName() === "globalThis" && !symbol.declarations?.length) {
                 name = "globalThis";
-            } else if (symbol?.declarations?.some((decl) => decl.getSourceFile().hasNoDefaultLib)) {
-                name = value.text;
+            } else if (symbol?.declarations?.some((decl) => this.isBuiltinDeclaration(decl))) {
+                name = ["global", "window", "self"].includes(value.text) ? "globalThis" : value.text;
             } else {
                 if (!symbol || seen.has(symbol)) return undefined;
                 seen.add(symbol);
@@ -235,7 +310,7 @@ export class APIIdentityCache {
             const receiver = this.resolveBuiltinName(member.receiver, checkWrites, seen);
             if (receiver == null) return undefined;
             const symbol = this.checker.getTypeAtLocation(unwrapExpression(member.receiver)).getProperty(member.name);
-            if (checkWrites && !symbol?.declarations?.some((decl) => decl.getSourceFile().hasNoDefaultLib)) {
+            if (checkWrites && !symbol?.declarations?.some((decl) => this.isBuiltinDeclaration(decl))) {
                 return undefined;
             }
             const global = symbol?.declarations?.find(
@@ -253,6 +328,26 @@ export class APIIdentityCache {
         }
         if (checkWrites && this.builtinWasWritten(name, value)) return undefined;
         return name;
+    }
+
+    private isBuiltinDeclaration(declaration: ts.Declaration): boolean {
+        const file = declaration.getSourceFile();
+        if (file.hasNoDefaultLib) return true;
+        const filename = file.fileName.replace(/\\/g, "/");
+        return (
+            file.isDeclarationFile &&
+            ((ts.isFunctionDeclaration(declaration) &&
+                declaration.name?.text === "fetch" &&
+                filename.endsWith("/@types/node/web-globals/fetch.d.ts") &&
+                ts.findAncestor(
+                    declaration,
+                    (node) => ts.isModuleDeclaration(node) && (node.flags & ts.NodeFlags.GlobalAugmentation) !== 0,
+                ) != null) ||
+                (ts.isVariableDeclaration(declaration) &&
+                    ts.isIdentifier(declaration.name) &&
+                    declaration.name.text === "global" &&
+                    filename.endsWith("/@types/node/globals.d.ts")))
+        );
     }
 
     private builtinWasWritten(name: string, read: ts.Expression): boolean {
@@ -282,9 +377,26 @@ export class APIIdentityCache {
                         !ts.isIdentifier(value) ||
                         this.checker
                             .getSymbolAtLocation(value)
-                            ?.declarations?.some((decl) => decl.getSourceFile().hasNoDefaultLib);
+                            ?.declarations?.some((decl) => this.isBuiltinDeclaration(decl));
                     const written = directGlobal ? this.resolveBuiltinName(value, false, new Set()) : undefined;
                     if (written != null) writes!.push({ name: written, node: node as ts.Expression });
+                }
+                if (
+                    ts.isCallExpression(node) &&
+                    node.arguments.length >= 2 &&
+                    ts.isStringLiteralLike(node.arguments[1]) &&
+                    ["Object.defineProperty", "Reflect.defineProperty"].includes(
+                        this.resolveBuiltinName(node.expression, false, new Set()) ?? "",
+                    )
+                ) {
+                    const receiver = this.resolveBuiltinName(node.arguments[0], false, new Set());
+                    if (receiver != null) {
+                        const name =
+                            receiver === "globalThis"
+                                ? node.arguments[1].text
+                                : `${receiver}.${node.arguments[1].text}`;
+                        writes!.push({ name, node });
+                    }
                 }
                 ts.forEachChild(node, visit);
             };
@@ -649,6 +761,22 @@ export class APIIdentityCache {
                                 ),
                             };
                         }
+                    } else if (
+                        ts.isCallExpression(assignment) &&
+                        assignment.arguments.length >= 2 &&
+                        ts.isStringLiteralLike(assignment.arguments[1]) &&
+                        ["Object.defineProperty", "Reflect.defineProperty"].includes(
+                            this.resolveBuiltinName(assignment.expression, false, new Set()) ?? "",
+                        )
+                    ) {
+                        const receiver = this.resolveRegistrationReceiver(assignment.arguments[0], state, new Set());
+                        state = {
+                            ...state,
+                            writes: new Map(state.writes).set(
+                                receiver,
+                                new Set(state.writes.get(receiver)).add(assignment.arguments[1].text),
+                            ),
+                        };
                     }
                 }
                 this.registrationStates.set(preceding, state);

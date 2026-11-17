@@ -86,6 +86,8 @@ export const expressSpec: TaintSpec = {
             name: "send",
             pattern: "express.Response.send",
             argPositions: [0],
+            argumentShapes: { 0: "string" },
+            jsonResponseBody: true,
             requireAPIIdentity: true,
             description: "HTTP response body (reflected XSS risk)",
             severity: "high",

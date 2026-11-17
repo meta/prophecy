@@ -311,6 +311,7 @@ export const FetchSink: SinkSpec = {
     name: "fetch",
     pattern: "fetch",
     argPositions: [0],
+    requireAPIIdentity: true,
     description: "HTTP fetch with attacker-controlled URL (SSRF/CSRF risk)",
     severity: "high",
     categories: ["ssrf"],

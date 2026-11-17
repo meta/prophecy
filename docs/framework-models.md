@@ -44,8 +44,32 @@ not prove that every locals key or template is safe: engine-specific options,
 unescaped output, and dynamically compiled template strings require separate
 sink/context rules.
 
+`res.send` keeps string and unknown bodies as HTML/XSS candidates. Runtime object
+and array constructions can use Express's default JSON serialization. Type
+assertions or a declared object type do not prove that runtime shape. The
+precise JSON case requires a direct inline handler on a fresh, locally known
+`express()` or `Router()` allocation, with no middleware or potential header
+setters in that file. Opaque application factories and imported application
+state remain candidates. This does not grant
+JSON strings sanitizer credit: `res.send(JSON.stringify(value))` is still a
+string response. Visible header setters, nonstandard response operations,
+response handoffs, and opaque or fluent receivers keep object-body candidates.
+The content-type check is deliberately conservative: a potential header setter
+in another handler in the same file also disables precision. It does not infer
+arbitrary middleware/application setup as a whole-program response invariant.
+
 ## Shared Node APIs
 
+- **Fetch:** requires standard global/declaration identity or the supported
+  `node-fetch` default / `undici.fetch` package exports. Native globals and
+  supported immutable aliases retain their identity; visible global replacement
+  invalidates later reads. An unrelated local function or installer method named
+  `fetch` is not an HTTP request sink. Typed factory results, fields and function
+  parameters also match a request-like callable contract returning a native
+  `Promise<Response>` with recognized DOM/Node/fetch-library response declarations.
+  This retains URL flows through wrapped transports; type-compatible mocks can
+  also produce conservative candidates. The contract is not proof that a function
+  performs network I/O, and a candidate does not establish arbitrary destination control.
 - **Execa and cross-spawn:** model the direct file/argv/options forms, separating
   executable selection, argument injection, and execution-bearing environment/
   shell options. Execa tagged templates, bound methods, `command`, and `node`
@@ -79,6 +103,24 @@ awaited literal `import("module")`, and supported constant aliases/destructuring
 An unawaited import Promise or a computed module name does not establish the
 module's API identity. This is not a whole-program proof that a module export
 or mutable property was never replaced at runtime.
+
+Native `Map`/`Set` cardinality reads retain their input provenance but cannot
+carry HTML, template, or dynamic-code string syntax. The model requires native
+getter declarations plus bounded constructor/immutable-alias origin proof for
+every observed alternative. Casts, unknown typed parameters, opaque receiver
+escapes, known getter/prototype replacements, and local lookalikes do not prove
+native cardinality. Opaque field or return origins remain conservative.
+Cardinality remains a candidate when it selects a file, executable,
+or argument; numeric data is not a general resource-selection sanitizer.
+
+Custom HTML/XML escaping, JSON script-data encoders, and local shell-quoting
+helpers generally remain conservative candidates. A helper name does not prove
+its implementation or use-site context. In particular, serialized JSON or an
+encoded string can become unsafe when decoded or used in a different context.
+
+Effect writeback from helper branches and callback wrappers remains partial,
+including writes to object parameters. Missing taint after such a call does not
+prove that a field stays clean.
 
 ## Regression coverage
 
