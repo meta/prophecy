@@ -15,6 +15,56 @@ import { vscodeExtensionSpec } from "../../src/static/spec/vscodeExtension";
 const FIXTURES = path.join(__dirname, "fixtures");
 const DIFF_REPO_ROOT = path.join(FIXTURES, "diff-repos", "sample");
 
+describe("patch project selection", () => {
+    it("analyzes configless files alongside configured projects", async () => {
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), "prophecy-configless-patch-"));
+        const patchFile = path.join(directory, "change.patch");
+        const source = `import * as vscode from "vscode";
+            import { exec } from "child_process";
+            export function activate() {
+                vscode.window.registerUriHandler({handleUri(uri: vscode.Uri) {exec(uri.query);}});
+            }`;
+        try {
+            for (const name of ["standalone", "configured"]) {
+                fs.mkdirSync(path.join(directory, name));
+                fs.writeFileSync(path.join(directory, name, "extension.ts"), source);
+            }
+            fs.writeFileSync(path.join(directory, "configured", "tsconfig.json"), '{"include":["*.ts"]}');
+            fs.writeFileSync(
+                patchFile,
+                "--- a/configured/extension.ts\n+++ b/configured/extension.ts\n" +
+                    "--- a/standalone/extension.ts\n+++ b/standalone/extension.ts\n",
+            );
+            const result = await analyzeDiffScreening({
+                patchFile,
+                repoRoot: directory,
+                outputFormat: "json",
+                spec: vscodeExtensionSpec,
+            });
+            expect(result.findings).toHaveLength(2);
+            expect(
+                result.findings.map((finding) => path.relative(directory, finding.sinkLocation.fileName)).sort(),
+            ).toEqual(["configured/extension.ts", "standalone/extension.ts"]);
+        } finally {
+            fs.rmSync(directory, { recursive: true, force: true });
+        }
+    });
+
+    it.each([
+        ["missing.ts", "Changed TypeScript file does not exist"],
+        ["../outside.ts", "Changed path is outside --repo-root"],
+    ])("diagnoses unscannable changed paths: %s", async (changed, message) => {
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), "prophecy-invalid-patch-path-"));
+        const patchFile = path.join(directory, "change.patch");
+        fs.writeFileSync(patchFile, `--- a/${changed}\n+++ b/${changed}\n`);
+        try {
+            await expect(analyzeDiffScreening({ patchFile, repoRoot: directory })).rejects.toThrow(message);
+        } finally {
+            fs.rmSync(directory, { recursive: true, force: true });
+        }
+    });
+});
+
 describe("diff helpers", () => {
     it("parses traditional unified headers, timestamps, and deletions", () => {
         expect(
@@ -107,7 +157,14 @@ diff --git a/bar/baz.tsx b/bar/baz.tsx
         const patchFile = path.join(directory, "change.patch");
         fs.writeFileSync(
             path.join(directory, "tsconfig.json"),
-            JSON.stringify({ compilerOptions: { module: "commonjs" }, include: ["*.ts"] }),
+            JSON.stringify({
+                compilerOptions: {
+                    module: "commonjs",
+                    typeRoots: [path.join(__dirname, "../../node_modules/@types")],
+                    types: ["node", "vscode"],
+                },
+                include: ["*.ts"],
+            }),
         );
         fs.writeFileSync(
             path.join(directory, "changed.ts"),

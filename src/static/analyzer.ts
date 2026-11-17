@@ -100,6 +100,7 @@ export interface AnalyzerResult {
  * runs taint analysis, and reports findings.
  */
 export async function analyze(options: AnalyzerOptions): Promise<AnalyzerResult> {
+    validateAnalysisOptions(options);
     const totalStart = Date.now();
     const spec = options.spec || detectSpec(options.projectDir);
     const maxDepth = options.maxDepth ?? 5;
@@ -108,6 +109,23 @@ export async function analyze(options: AnalyzerOptions): Promise<AnalyzerResult>
     });
     const releaseIndex = indexPatternMatches(metrics);
     return analyzeWithMetrics(options, totalStart, spec, maxDepth, metrics).finally(releaseIndex);
+}
+
+export function validateAnalysisOptions(
+    options: Pick<AnalyzerOptions, "maxDepth" | "shardCount" | "shardIndex">,
+): void {
+    const maxDepth = options.maxDepth ?? 5;
+    const shardCount = options.shardCount ?? 1;
+    const shardIndex = options.shardIndex ?? 0;
+    if (!Number.isSafeInteger(maxDepth) || maxDepth < 0) {
+        throw new Error("--max-depth must be a nonnegative safe integer");
+    }
+    if (!Number.isSafeInteger(shardCount) || shardCount < 1) {
+        throw new Error("--shard-count must be a positive safe integer");
+    }
+    if (!Number.isSafeInteger(shardIndex) || shardIndex < 0 || shardIndex >= shardCount) {
+        throw new Error("--shard-index must be an integer from 0 through --shard-count - 1");
+    }
 }
 
 async function analyzeWithMetrics(
@@ -439,7 +457,7 @@ async function analyzeWithMetrics(
         entryPointCount: entryPoints.length,
         cacheHits: interproc.cacheHits,
         metrics: interproc.getMetrics(),
-        warnings: [...new Set(result.warnings)],
+        warnings: [...new Set([...(parsed.warnings ?? []), ...result.warnings])],
         ...(typeEnvironmentWarning != null ? { typeEnvironmentWarning } : {}),
         // Relativize skipped-EP locations to the repo root for consistency
         // with the per-EP progress lines (e.g. xplat/vscode/... rather than

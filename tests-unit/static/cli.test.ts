@@ -87,6 +87,63 @@ beforeAll(() => {
 }, 60_000);
 
 describe("CLI smoke tests", () => {
+    it.each([
+        "--shard-count 0",
+        "--shard-count 1.5",
+        "--shard-count NaN",
+        "--shard-count Infinity",
+        "--shard-count 2 --shard-index 2",
+        "--shard-count 2 --shard-index -1",
+        "--shard-count 2 --shard-index 0.5",
+        "--max-depth -1",
+        "--max-depth 1.5",
+        "--max-depth NaN",
+        "--max-depth Infinity",
+        "--max-depth wrong",
+    ])("rejects invalid numeric arguments: %s", (flags) => {
+        const result = runCli(`--project ${FIXTURES}/uri-handler-rce --format json ${flags}`);
+        expect(result.exitCode).toBe(1);
+        expect(result.stdout).toBe("");
+        expect(result.stderr).toContain("must be");
+    });
+
+    it.each(["0", "1"])("rejects resolved config failures with PROPHECY_NO_WORKER=%s", (noWorker) => {
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), "prophecy-cli-config-"));
+        const sourceDirectory = path.join(directory, "src");
+        fs.mkdirSync(sourceDirectory);
+        fs.writeFileSync(path.join(sourceDirectory, "main.ts"), "export function main() {}\n");
+        const config = path.join(directory, "tsconfig.json");
+        const patch = path.join(directory, "change.patch");
+        fs.writeFileSync(patch, "--- a/src/main.ts\n+++ b/src/main.ts\n");
+        try {
+            fs.writeFileSync(config, "{ invalid json !!!");
+            for (const mode of [`--project ${sourceDirectory}`, `--patch-file ${patch} --repo-root ${directory}`]) {
+                const result = runCli(`${mode} --format json`, { PROPHECY_NO_WORKER: noWorker });
+                expect(result.exitCode).toBe(1);
+                expect(result.stdout).toBe("");
+                expect(result.stderr).toContain("failed to parse tsconfig.json");
+            }
+            for (const invalidConfig of [{ extends: "./missing.json" }, { files: ["missing.ts"] }]) {
+                fs.writeFileSync(config, JSON.stringify(invalidConfig));
+                const result = runCli(`--project ${directory} --require-types --format json`, {
+                    PROPHECY_NO_WORKER: noWorker,
+                });
+                expect(result.exitCode).toBe(1);
+                expect(result.stdout).toBe("");
+                expect(result.stderr).toContain("failed to load");
+            }
+            fs.writeFileSync(config, '{"include":["wrong/*.ts"]}');
+            const empty = runCli(`--project ${directory} --require-types --format json`, {
+                PROPHECY_NO_WORKER: noWorker,
+            });
+            expect(empty.exitCode).toBe(0);
+            expect(JSON.parse(empty.stdout)).toEqual([]);
+            expect(empty.stderr).toContain("WARNING: No inputs were found");
+        } finally {
+            fs.rmSync(directory, { recursive: true, force: true });
+        }
+    });
+
     it("requires type declarations in patch mode and warns without the flag", () => {
         const directory = fs.mkdtempSync(path.join(os.tmpdir(), "prophecy-cli-types-"));
         const patch = path.join(directory, "change.patch");

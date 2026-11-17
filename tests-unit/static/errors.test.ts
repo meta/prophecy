@@ -21,10 +21,8 @@ describe("E2E: Error handling edge cases", () => {
         ).rejects.toThrow("Project directory does not exist");
     });
 
-    it("malformed tsconfig.json: does not crash with unhandled exception", async () => {
-        const result = await analyzeFixture("malformed-tsconfig");
-        expect(result).toBeDefined();
-        expect(Array.isArray(result.findings)).toBe(true);
+    it("malformed tsconfig.json: rejects with a configuration diagnostic", async () => {
+        await expect(analyzeFixture("malformed-tsconfig")).rejects.toThrow("failed to parse tsconfig.json");
     });
 
     it("TypeScript syntax errors: reports syntax errors with locations", async () => {
@@ -45,5 +43,6 @@ describe("E2E: Error handling edge cases", () => {
         const result = await analyzeFixture("empty-project");
         expect(result).toBeDefined();
         expect(result.findings.length).toBe(0);
+        expect(result.warnings.join("\n")).toContain("No inputs were found");
     });
 });

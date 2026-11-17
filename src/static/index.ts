@@ -9,9 +9,9 @@ import { Worker, isMainThread, workerData } from "worker_threads";
 import * as yargs from "yargs";
 import * as path from "path";
 import * as fs from "fs";
-import * as ts from "typescript";
 import { format } from "util";
-import { analyze, AnalyzerOptions, AnalyzerResult } from "./analyzer";
+import { analyze, AnalyzerOptions, AnalyzerResult, validateAnalysisOptions } from "./analyzer";
+import { ProjectConfigurationError } from "./parser";
 import { formatFindingsJSON } from "./reporter";
 import { analyzeDiffScreening } from "./diff";
 import { TaintSpec } from "./spec/types";
@@ -216,6 +216,14 @@ function parseArgv(): CliArgs {
             type: "boolean",
             default: false,
         })
+        .check((argv) => {
+            validateAnalysisOptions({
+                maxDepth: argv["max-depth"],
+                shardCount: argv["shard-count"],
+                shardIndex: argv["shard-index"],
+            });
+            return true;
+        })
         .help().argv as CliArgs;
 }
 
@@ -279,12 +287,6 @@ async function runAnalysis(argv: CliArgs): Promise<number> {
 
         if (!fs.statSync(projectDir).isDirectory()) {
             console.error(`Error: path is not a directory: ${projectDir}`);
-            return 1;
-        }
-
-        const tsconfigError = readTsConfigSyntaxError(projectDir);
-        if (tsconfigError) {
-            console.error(`Error: failed to parse tsconfig.json in ${projectDir}:\n  ${tsconfigError}`);
             return 1;
         }
 
@@ -409,6 +411,10 @@ async function runAnalysis(argv: CliArgs): Promise<number> {
         return 1;
     }
 
+    for (const warning of new Set(result.warnings)) {
+        console.error(`[prophecy] WARNING: ${warning}`);
+    }
+
     // Surface incomplete entry points, including context limits that retain
     // findings discovered before saturation. stderr keeps stdout clean for
     // json/sapp consumers. Routine analysis limits and
@@ -472,7 +478,7 @@ async function runAnalysis(argv: CliArgs): Promise<number> {
 if (isMainThread) {
     main().catch((err: any) => {
         console.error(`Error: ${err?.stack ?? err?.message ?? err}`);
-        process.exit(2);
+        process.exit(err instanceof ProjectConfigurationError ? 1 : 2);
     });
 } else {
     // Write synchronously to the shared descriptors: process.exit() can end
@@ -482,7 +488,7 @@ if (isMainThread) {
         .then((code) => process.exit(code))
         .catch((err: any) => {
             console.error(`Error: ${err?.stack ?? err?.message ?? err}`);
-            process.exit(2);
+            process.exit(err instanceof ProjectConfigurationError ? 1 : 2);
         });
 }
 
@@ -591,23 +597,6 @@ function writeSappOutputBundle(outputDir: string, results: AnalyzerResult[], sha
 
 function writeJsonFile(filePath: string, contents: unknown): void {
     fs.writeFileSync(filePath, JSON.stringify(contents, null, 2) + "\n");
-}
-
-function readTsConfigSyntaxError(projectDir: string): string | undefined {
-    const tsconfigPath = path.join(projectDir, "tsconfig.json");
-    if (!fs.existsSync(tsconfigPath)) return undefined;
-
-    const configFile = ts.readConfigFile(tsconfigPath, ts.sys.readFile);
-    return configFile.error ? formatDiagnostic(configFile.error) : undefined;
-}
-
-function formatDiagnostic(diagnostic: ts.Diagnostic): string {
-    const message = ts.flattenDiagnosticMessageText(diagnostic.messageText, "\n");
-    if (diagnostic.file && diagnostic.start !== undefined) {
-        const { line, character } = diagnostic.file.getLineAndCharacterOfPosition(diagnostic.start);
-        return `${diagnostic.file.fileName}:${line + 1}:${character + 1}: ${message}`;
-    }
-    return message;
 }
 
 function resolveExistingCliPath(inputPath: string): string {

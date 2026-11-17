@@ -7,7 +7,8 @@
 
 import * as fs from "fs";
 import * as path from "path";
-import { analyze, AnalyzerResult, detectSpec, inferSappProjectName } from "./analyzer";
+import { analyze, AnalyzerResult, detectSpec, inferSappProjectName, validateAnalysisOptions } from "./analyzer";
+import { ProjectConfigurationError } from "./parser";
 import { formatFindings, formatFindingsJSON, formatFindingsMermaid } from "./reporter";
 import { formatFindingsLint, generateFixes } from "./fix";
 import { TaintFinding, TaintSpec } from "./spec/types";
@@ -38,9 +39,19 @@ export interface DiffScreeningOptions {
 }
 
 export async function analyzeDiffScreening(options: DiffScreeningOptions): Promise<AnalyzerResult> {
+    validateAnalysisOptions(options);
     const repoRoot = await resolveRepoRoot(options.repoRoot);
     const changedRelativePaths = await resolveChangedPaths(options);
-    const changedAbsolutePaths = new Set(changedRelativePaths.map((filePath) => path.resolve(repoRoot, filePath)));
+    const changedAbsolutePaths = new Set(
+        changedRelativePaths.map((filePath) => {
+            const absolute = path.resolve(repoRoot, filePath);
+            const relative = path.relative(repoRoot, absolute);
+            if (relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) {
+                throw new ProjectConfigurationError(`Changed path is outside --repo-root: ${filePath}`);
+            }
+            return absolute;
+        }),
+    );
     const changedTsPaths = [...changedAbsolutePaths].filter(isTypeScriptFile);
     const projectDirs = [...inferProjectDirs(changedTsPaths, repoRoot)];
     const projectSpecs = new Map(projectDirs.map((projectDir) => [projectDir, options.spec ?? detectSpec(projectDir)]));
@@ -227,16 +238,16 @@ function inferProjectDirs(changedTsPaths: string[], repoRoot: string): Set<strin
     const projectDirs = new Set<string>();
 
     for (const filePath of changedTsPaths) {
-        const projectDir = findNearestProjectDir(filePath, repoRoot);
-        if (projectDir) {
-            projectDirs.add(projectDir);
+        if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+            throw new ProjectConfigurationError(`Changed TypeScript file does not exist: ${filePath}`);
         }
+        projectDirs.add(findNearestProjectDir(filePath, repoRoot));
     }
 
     return projectDirs;
 }
 
-function findNearestProjectDir(filePath: string, repoRoot: string): string | undefined {
+function findNearestProjectDir(filePath: string, repoRoot: string): string {
     const root = path.resolve(repoRoot);
     let currentDir = path.dirname(filePath);
     let packageDir: string | undefined;
@@ -254,7 +265,8 @@ function findNearestProjectDir(filePath: string, repoRoot: string): string | und
         currentDir = path.dirname(currentDir);
     }
 
-    return packageDir;
+    // Configless sources use the parser's directory fallback; imports still resolve across directories.
+    return packageDir ?? path.dirname(filePath);
 }
 
 function isTypeScriptFile(filePath: string): boolean {
