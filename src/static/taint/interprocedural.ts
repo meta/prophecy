@@ -990,8 +990,11 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
         const inheritedFieldState = this.extractInstanceFieldState(callerState);
 
         // Check for executeCommand bridge: follow taint into registered command handler
-        const callName = getCallChainName(callExpr.expression);
-        if (!boundFunction && callName.endsWith("executeCommand") && callExpr.arguments.length >= 1) {
+        if (
+            !boundFunction &&
+            callExpr.arguments.length >= 1 &&
+            APIIdentityCache.forChecker(this.checker).matchesAPI(callExpr.expression, "vscode.commands.executeCommand")
+        ) {
             const cmdNameArg = callExpr.arguments[0];
             const commandName = resolveStaticString(this.checker, cmdNameArg);
             if (commandName != null) {
