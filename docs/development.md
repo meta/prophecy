@@ -4,9 +4,10 @@ Run the commands below from the Prophecy project root. For installation and
 analysis commands, see [Getting started](../README.md#getting-started).
 
 Tests include inline source cases, multi-file fixtures, CLI behavior, and
-output-format checks. To run a subset, pass a Jest filter:
+output-format checks. Run the full suite or pass a Jest filter for a subset:
 
 ```bash
+pnpm test --runInBand
 pnpm test --runInBand --testPathPattern=e2e
 pnpm test --runInBand --testNamePattern=websocket
 pnpm test:pnpm  # install/build/scan a pnpm-isolated VS Code extension
@@ -41,7 +42,7 @@ pnpm format:check  # list files oxfmt would change; exits 1 if any
 
 A new project type needs a `TaintSpec` in `src/static/spec/`, auto-detection in
 `detectSpec()` in `src/static/analyzer.ts`, and a preset in
-`src/static/index.ts` if it should be usable without `--spec`. Engine changes
+`src/static/spec/presets.ts` if it should be usable without `--spec`. Engine changes
 are needed when the framework's callback shapes, dispatch, or dataflow fall
 outside the supported models.
 

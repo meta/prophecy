@@ -113,10 +113,14 @@ Using preset: auto
   → EP 2/2: URI handler (vscode:// deeplink) @ /path/to/prophecy/tests-unit/static/fixtures/uri-handler-rce/extension.ts:15:13
 Discovered 2 entry point(s)
 
-Found 1 potential vulnerability:
+Found 1 modeled taint flows in 1 presentation groups: 1 modeled security candidates, 0 file-access traces, 0 generic persistence traces.
+These traces do not establish exploitability, disclosure, privilege crossing, or an attacker boundary.
 
 ──────────────────────────────────────────────────────────────────────
-[1/1] CRITICAL: Command execution via child_process.exec
+[1/1] Modeled security candidate (rce; 1 raw findings)
+  Trace 1/1: CRITICAL: Command execution via child_process.exec
+  Raw finding / entry context: handleUri.uri|exec|URI handler (vscode:// deeplink)|/path/to/prophecy/tests-unit/static/fixtures/uri-handler-rce/extension.ts|17
+  Modeled security candidate; exploitability and attacker boundary not established.
 
   Source: URI handler parameter (attacker-controlled via vscode:// deeplink)
     at /path/to/prophecy/tests-unit/static/fixtures/uri-handler-rce/extension.ts:15:23  [uri: vscode.Uri]
@@ -344,16 +348,23 @@ analyzer does not apply repairs or verify their runtime safety.
 
 ### Known limitations
 
-- **Dynamic dispatch**: a call to an abstract or interface method declared in
-  the program expands to implementations in the program, up to eight; beyond
-  that, unresolved passthrough applies. Methods in declaration files,
-  subclass overrides of a base-class method that has a body, object-literal
-  implementations, union receiver types, and interface property signatures
-  such as `run: (cmd: string) => void` are not expanded.
-- **Instance and callback state**: instance identity through `.at()`,
-  `.map()`, and `.filter()` is not modeled, object-literal methods are not
-  tracked as function values, and callback return values from unresolved
-  higher-order calls generally do not flow to the call's result.
+- **Project references**: referenced TypeScript projects are not traversed. A
+  reference-only solution config is rejected rather than reported as an empty
+  successful scan; pass separate `--project` roots for the referenced projects.
+- **Dynamic dispatch**: known concrete receiver classes select in-program
+  method bodies, including base-class overrides and function-valued class
+  properties. Open abstract/interface and base-class calls expand to at most
+  eight in-program implementations. Beyond that limit, known concrete/base
+  targets are joined with an unresolved alternative; their heap writes are not
+  unconditional. Declaration files supply no executable bodies, and arbitrary
+  structural implementations, dynamic method names, and unknown receiver
+  alternatives are not a closed-world dispatch set.
+- **Instance and callback state**: supported `.map()` calls use callback
+  results; `.filter()` retains original element values and identities rather
+  than predicate results. Function values can carry captured instance state.
+  These models do not cover all JavaScript aliasing or scheduling: instance
+  identity through `.at()`, arbitrary microtask ordering, and callbacks of
+  unknown higher-order calls remain unmodeled.
 - **Control flow**: branches use separate state and loops iterate to a bounded
   fixed point; loop exits, switch cases, and `try`/`catch`/`finally` are
   conservative. This is not a fully path-sensitive analysis.
@@ -509,7 +520,14 @@ string codes.
 | 9009 | `Prophecy-WorkspaceEdit`   | `workspace_edit`            |
 | 9010 | `Prophecy-ArgInjection`    | `arg_injection`             |
 | 9011 | `Prophecy-PromptInjection` | `prompt_injection`          |
+| 9012 | `Prophecy-FileIntegrity`   | `file_integrity`            |
+| 9013 | `Prophecy-FileAccess`      | `file_access`               |
 | 9099 | `Prophecy-Unknown`         | Unknown or missing category |
+
+Built-in file-access and generic content-persistence rules describe traces,
+not established disclosure or execution. See
+[precision reporting](docs/precision-reporting.md) for reporting kinds,
+severity, and presentation groups.
 
 ## Development
 

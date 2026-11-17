@@ -85,13 +85,13 @@ The focused suites include positive flows, clean controls, unrelated API names,
 and cross-file helpers:
 
 ```bash
-yarn build
-./node_modules/.bin/jest --config jest.static.config.js --runInBand \
+pnpm build
+pnpm exec jest --config jest.static.config.js --runInBand \
   --testPathPattern='frameworkCoverage|nodeApi|apiBoundary|presetCoverage|httpRequest|eventFlowRequest|discovery'
 ```
 
 The tests use small declaration fixtures for supported API signatures; they do
 not launch Electron, run framework servers, or exercise browser/network policy.
 Framework-version differences outside those signatures remain a compatibility
-limit. See the [testing guide](../.llms/skills/prophecy-dev/references/testing.md)
-for full-suite and corpus-comparison requirements.
+limit. See the [development guide](development.md) for full-suite commands and
+fixture conventions.
