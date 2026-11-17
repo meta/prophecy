@@ -324,7 +324,7 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
     /** Classes and interfaces keyed by each class or interface they directly extend or implement. */
     private subtypes: Map<ts.Symbol, (ts.ClassLikeDeclaration | ts.InterfaceDeclaration)[]> = new Map();
     private settingScopes: SettingScopes | undefined;
-    private overrideCandidateCache: WeakMap<ts.Declaration, ts.FunctionLikeDeclaration[]> = new WeakMap();
+    private overrideCandidateCache: WeakMap<ts.Declaration, ts.FunctionLikeDeclaration[] | null> = new WeakMap();
     private handlerRegistrations: HandlerRegistration[] = [];
     private handlerMounts: HandlerMount[] = [];
     private continuations = new Map<string, { handlers: RegisteredHandler[]; index: number }>();
@@ -1138,14 +1138,14 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
         const funcDecl = boundFunction?.declaration ?? this.resolveCallTarget(callExpr);
         const concrete = boundFunction ? undefined : this.concreteDispatchTargets(callExpr, receiverInstance);
         const exhaustive = concrete != null && !receiverInstance?.classDeclarationsUnknown;
-        const overrides = boundFunction
-            ? []
-            : exhaustive
-              ? concrete!
-              : [...new Set([...(concrete || []), ...this.overrideCandidates(callExpr)])];
+        const indexedOverrides = boundFunction || exhaustive ? [] : this.overrideCandidates(callExpr);
+        const overrides = exhaustive ? concrete! : [...new Set([...(concrete || []), ...(indexedOverrides ?? [])])];
+        // Overflow is unresolved dispatch, not proof that the base body is the
+        // only target. Its return and heap writes are not unconditional.
+        if (indexedOverrides === null && funcDecl?.body && !overrides.includes(funcDecl)) overrides.push(funcDecl);
         if (overrides.length > 0) {
             const joined =
-                overrides.length === 1
+                overrides.length === 1 && indexedOverrides !== null
                     ? this.analyzeFunctionCall(
                           callExpr,
                           argTaints,
@@ -1164,7 +1164,7 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
                       )
                     : this.analyzeDispatchAlternatives(
                           callExpr,
-                          overrides,
+                          indexedOverrides === null ? [...overrides, undefined] : overrides,
                           argTaints,
                           checker,
                           depth,
@@ -1174,7 +1174,12 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
                           runtimeArguments,
                       );
             // Only an exhaustive allocation set rules out other implementations.
-            return joined && { ...joined, returnUnknown: joined.returnUnknown || !exhaustive };
+            return (
+                joined && {
+                    ...joined,
+                    returnUnknown: joined.returnUnknown || !exhaustive,
+                }
+            );
         }
         if (!funcDecl?.body) return undefined;
 
@@ -1346,9 +1351,10 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
         };
     }
 
+    /** An unknown implementation contributes an unchanged heap, not a strong base-body clear. */
     private analyzeDispatchAlternatives(
         call: ts.CallExpression,
-        declarations: ts.FunctionLikeDeclaration[],
+        declarations: (ts.FunctionLikeDeclaration | undefined)[],
         taints: (TaintValue[] | undefined)[],
         checker: ts.TypeChecker,
         depth: number,
@@ -1370,7 +1376,7 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
                 const copies = new Map<InstanceState, InstanceState>();
                 const forked = forkInstanceStates(roots, copies);
                 const branchReceiver = forked[0];
-                if (branchReceiver?.classDeclarations && member) {
+                if (declaration && branchReceiver?.classDeclarations && member) {
                     branchReceiver.classDeclarations = branchReceiver.classDeclarations.filter(
                         (candidate) => this.methodImplementation(candidate, member.name) === declaration,
                     );
@@ -1388,18 +1394,33 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
                         ]),
                     ),
                 );
-                const result = this.analyzeFunctionCall(
-                    call,
-                    taints,
-                    checker,
-                    depth,
-                    forkTaintState(state),
-                    branchReceiver,
-                    branchArgs,
-                    { declaration, captured: new Map(), capturedInstances: new Map(), thisInstance: branchReceiver },
-                    branchRuntime,
-                );
-                if (branchReceiver && result) {
+                const result: InterproceduralCallResult | undefined = declaration
+                    ? this.analyzeFunctionCall(
+                          call,
+                          taints,
+                          checker,
+                          depth,
+                          forkTaintState(state),
+                          branchReceiver,
+                          branchArgs,
+                          {
+                              declaration,
+                              captured: new Map(),
+                              capturedInstances: new Map(),
+                              thisInstance: branchReceiver,
+                          },
+                          branchRuntime,
+                      )
+                    : {
+                          returnTaints: undefined,
+                          returnUnknown: true,
+                          returnInstanceUnknown: true,
+                          canReturn: true,
+                          findings: [],
+                          fieldState: this.extractInstanceFieldState(state),
+                          clearedFieldSymbols: [],
+                      };
+                if (declaration && branchReceiver && result) {
                     for (const symbol of result.clearedFieldSymbols) branchReceiver.fields.delete(symbol);
                     for (const [symbol, values] of result.fieldState) branchReceiver.fields.set(symbol, values);
                 }
@@ -1730,7 +1751,8 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
     }
 
     hasOverrideCandidates(callExpr: ts.CallExpression): boolean {
-        return this.overrideCandidates(callExpr).length > 0;
+        const candidates = this.overrideCandidates(callExpr);
+        return candidates === null || candidates.length > 0;
     }
 
     /** Explicit `super` calls select the base implementation, never an override. */
@@ -1765,8 +1787,8 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
         ];
     }
 
-    /** Expand an open interface/base-class dispatch within the indexed program. */
-    private overrideCandidates(callExpr: ts.CallExpression): ts.FunctionLikeDeclaration[] {
+    /** Expand open dispatch; null distinguishes candidate overflow from an empty set. */
+    private overrideCandidates(callExpr: ts.CallExpression): ts.FunctionLikeDeclaration[] | null {
         const member = this.dispatchMember(callExpr);
         if (!member) return [];
         const receiverType = this.checker.getNonNullableType(this.checker.getTypeAtLocation(member.receiver));
@@ -1782,7 +1804,7 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
             );
         if (!method || method.getSourceFile().isDeclarationFile) return [];
         const cached = this.overrideCandidateCache.get(method);
-        if (cached) return cached;
+        if (cached !== undefined) return cached;
 
         const candidates = new Set<ts.FunctionLikeDeclaration>();
         const owner = method.parent;
@@ -1809,10 +1831,14 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
                 }
             }
         }
-        const result = candidates.size <= MAX_OVERRIDE_CANDIDATES ? [...candidates] : [];
+        const result = candidates.size <= MAX_OVERRIDE_CANDIDATES ? [...candidates] : null;
         // An ordinary body with no alternative implementation needs no open-
         // hierarchy join; preserve its precise return summary.
-        if (ts.isClassLike(owner) && result.length === 1 && result[0] === this.methodImplementation(owner, member.name))
+        if (
+            ts.isClassLike(owner) &&
+            result?.length === 1 &&
+            result[0] === this.methodImplementation(owner, member.name)
+        )
             result.length = 0;
         this.overrideCandidateCache.set(method, result);
         return result;
