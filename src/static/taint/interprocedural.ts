@@ -158,6 +158,7 @@ function argumentDefaultKind(
 ): "always" | "maybe" | undefined {
     const arg = unwrapExpression(expression);
     if (ts.isVoidExpression(arg)) return "always";
+    if (ts.isNumericLiteral(arg)) return undefined;
     if (ts.isConditionalExpression(arg)) {
         const left = argumentDefaultKind(checker, arg.whenTrue, new Set(seen));
         const right = argumentDefaultKind(checker, arg.whenFalse, new Set(seen));

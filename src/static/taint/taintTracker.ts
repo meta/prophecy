@@ -72,6 +72,38 @@ function createTaintState(): CopyOnWriteMap<ts.Symbol, readonly TaintValue[]> {
 // than the analyzer's interprocedural depth limit.
 const MAX_LOOP_ITERATIONS = 16;
 
+// Binding metadata is boxed in reserved slots so container iteration cannot consume it.
+const BINDING_PROPERTY = "$property:";
+const BINDING_OBJECT_SHAPE = "$properties";
+const BINDING_ARRAY_SHAPE = "$elements";
+const BINDING_VALUE_STATE = "$defined";
+const BINDING_DEFINED = ts.factory.createNumericLiteral(0);
+const BINDING_UNDEFINED = ts.factory.createVoidZero();
+
+function isBindingPayload(key: string): boolean {
+    return key.startsWith(BINDING_PROPERTY) || key.startsWith("$taint:");
+}
+
+function missingBindingPayload(owner: InstanceState, key: string): InstanceState {
+    const value = createInstanceState();
+    const shape = key.startsWith(BINDING_PROPERTY) ? BINDING_OBJECT_SHAPE : BINDING_ARRAY_SHAPE;
+    if (owner.elementInstances.has(shape)) value.valueExpression = BINDING_UNDEFINED;
+    if (key.startsWith("$taint:")) {
+        const defined = createInstanceState();
+        defined.valueExpression = value.valueExpression;
+        value.elementInstances.set(BINDING_VALUE_STATE, defined);
+    }
+    if (key.startsWith(BINDING_PROPERTY)) {
+        const name = key.slice(BINDING_PROPERTY.length);
+        value.valueTaints = ownTaintList(
+            [...owner.fields].filter(([property]) => property.getName() === name).flatMap(([, taints]) => taints),
+        );
+        const instance = [...owner.fieldInstances].find(([property]) => property.getName() === name)?.[1];
+        if (instance) value.elementInstances.set("$value", instance);
+    }
+    return value;
+}
+
 type ShellInsertionContext = "commandStart" | "unsafe" | { command: string };
 
 export interface InstanceState {
@@ -142,7 +174,13 @@ export function expandCallArguments(
             expanded.push({
                 expression,
                 taints: values,
-                instance: instance && mergeInstanceStates([...instance.elementInstances.values()]),
+                instance:
+                    instance &&
+                    mergeInstanceStates(
+                        [...instance.elementInstances]
+                            .filter(([key]) => !key.startsWith("$"))
+                            .map(([, value]) => value),
+                    ),
                 unknownSpread: true,
             });
         }
@@ -339,7 +377,11 @@ function mergeInstanceStatesAtDepth(instances: InstanceState[], depth: number): 
         if (nested) merged.fieldInstances.set(symbol, nested);
     }
     for (const [key, candidates] of nestedElements) {
-        const nested = mergeInstanceStatesAtDepth(candidates, depth + 1);
+        if ([BINDING_OBJECT_SHAPE, BINDING_ARRAY_SHAPE].includes(key) && candidates.length !== unique.length) continue;
+        const values = isBindingPayload(key)
+            ? unique.map((owner) => owner.elementInstances.get(key) ?? missingBindingPayload(owner, key))
+            : candidates;
+        const nested = mergeInstanceStatesAtDepth(values, depth + 1);
         if (nested) merged.elementInstances.set(key, nested);
     }
     return merged;
@@ -494,7 +536,7 @@ export function functionFreeSymbols(checker: ts.TypeChecker, fn: ts.FunctionLike
     if (cached) return cached;
 
     const symbols = new Set<ts.Symbol>();
-    const stack: ts.Node[] = fn.body ? [fn.body] : [];
+    const stack: ts.Node[] = [...fn.parameters, ...(fn.body ? [fn.body] : [])];
     for (const param of fn.parameters) {
         if (param.initializer) stack.push(param.initializer);
     }
@@ -1018,41 +1060,27 @@ export class TaintTracker {
         iterInstance: InstanceState | undefined,
         state: TaintState,
     ): void {
-        if (!ts.isVariableDeclarationList(stmt.initializer)) return;
-
-        for (const decl of stmt.initializer.declarations) {
-            const sym = this.checker.getSymbolAtLocation(decl.name);
-            if (!sym) continue;
-
-            if (iterTaints) {
-                state.set(
-                    sym,
-                    iterTaints.map((taint) =>
-                        propagate(
-                            taint,
-                            {
-                                kind: "arrayIndex",
-                                location: this.nodeLocation(decl),
-                                description: `iterated from ${stmt.expression.getText()}`,
-                            },
-                            this.metrics,
-                        ),
-                    ),
-                );
-            } else {
-                state.delete(sym);
-            }
-
-            if (ts.isForOfStatement(stmt) && iterInstance) {
-                const elementInstance = this.getElementInstance(iterInstance);
-                if (elementInstance) {
-                    this.instanceFieldState.set(sym, elementInstance);
-                } else {
-                    this.instanceFieldState.delete(sym);
-                }
-            } else {
-                this.instanceFieldState.delete(sym);
-            }
+        const taints =
+            iterInstance && ts.isForOfStatement(stmt) && this.hasHostType(iterInstance, "Array")
+                ? this.arrayElementTaints(iterInstance, undefined, iterTaints)
+                : iterTaints;
+        const instance = ts.isForOfStatement(stmt) && iterInstance ? this.getElementInstance(iterInstance) : undefined;
+        const stepped = taints?.map((taint) =>
+            propagate(
+                taint,
+                {
+                    kind: "arrayIndex",
+                    location: this.nodeLocation(stmt.initializer),
+                    description: `iterated from ${stmt.expression.getText()}`,
+                },
+                this.metrics,
+            ),
+        );
+        if (ts.isVariableDeclarationList(stmt.initializer)) {
+            for (const decl of stmt.initializer.declarations)
+                this.bindDestructuring(decl.name, stepped, instance, state);
+        } else {
+            this.assignBindingTarget(stmt.initializer, stepped, instance, state);
         }
     }
 
@@ -1229,8 +1257,17 @@ export class TaintTracker {
                 if (nested) merged.fieldInstances.set(symbol, nested);
             }
             for (const key of new Set([...left.elementInstances.keys(), ...right.elementInstances.keys()])) {
-                const leftNested = left.elementInstances.get(key);
-                const rightNested = right.elementInstances.get(key);
+                if (
+                    [BINDING_OBJECT_SHAPE, BINDING_ARRAY_SHAPE].includes(key) &&
+                    (!left.elementInstances.has(key) || !right.elementInstances.has(key))
+                )
+                    continue;
+                const leftNested =
+                    left.elementInstances.get(key) ??
+                    (isBindingPayload(key) ? missingBindingPayload(left, key) : undefined);
+                const rightNested =
+                    right.elementInstances.get(key) ??
+                    (isBindingPayload(key) ? missingBindingPayload(right, key) : undefined);
                 const nested =
                     leftNested && rightNested
                         ? mergeInstances(leftNested, rightNested, depth + 1)
@@ -1497,95 +1534,166 @@ export class TaintTracker {
                     this.instanceFieldState.delete(sym);
                 }
             }
-        } else if (ts.isObjectBindingPattern(decl.name)) {
-            this.analyzeObjectDestructuring(decl.name, initTaints, state);
-        } else if (ts.isArrayBindingPattern(decl.name)) {
-            this.analyzeArrayDestructuring(decl.name, initTaints, initInstance, state);
+        } else {
+            this.bindDestructuring(decl.name, initTaints, initInstance, state);
         }
     }
 
-    /**
-     * Consume one known aggregate-property component for each direct
-     * identifier binding. Taint without a scoped path propagates
-     * conservatively; nested binding targets are not expanded.
-     */
-    private analyzeObjectDestructuring(
-        pattern: ts.ObjectBindingPattern,
-        sourceTaints: TaintValue[] | undefined,
-        state: TaintState,
-    ): void {
-        if (!sourceTaints) return;
-
-        for (const element of pattern.elements) {
-            if (ts.isBindingElement(element) && ts.isIdentifier(element.name)) {
-                const bindingName = element.name;
-                const sym = this.checker.getSymbolAtLocation(bindingName);
-                if (sym) {
-                    const propName = element.propertyName ? this.propertyName(element.propertyName) : bindingName.text;
-                    const propertyTaints =
-                        propName == null
-                            ? sourceTaints
-                            : TaintTracker.taintsForAggregateProperty(sourceTaints, propName);
-                    const stepped = propertyTaints.map((t) =>
-                        propagate(
-                            t,
-                            {
-                                kind: "destructuring",
-                                location: this.nodeLocation(element),
-                                description: `destructured property '${propName}' into '${bindingName.text}'`,
-                            },
-                            this.metrics,
+    private bindingValueExpression(expression: ts.Expression): ts.Expression | undefined {
+        const value = unwrapExpression(expression);
+        if (ts.isVoidExpression(value) || ts.isOmittedExpression(value)) return BINDING_UNDEFINED;
+        if (
+            ts.isIdentifier(value) &&
+            value.text === "undefined" &&
+            this.checker
+                .getSymbolAtLocation(value)
+                ?.declarations?.every((declaration) => declaration.getSourceFile().isDeclarationFile)
+        )
+            return BINDING_UNDEFINED;
+        if (
+            ts.isStringLiteralLike(value) ||
+            ts.isNumericLiteral(value) ||
+            [ts.SyntaxKind.NullKeyword, ts.SyntaxKind.TrueKeyword, ts.SyntaxKind.FalseKeyword].includes(value.kind) ||
+            ts.isObjectLiteralExpression(value) ||
+            ts.isArrayLiteralExpression(value) ||
+            ts.isArrowFunction(value) ||
+            ts.isFunctionExpression(value) ||
+            ts.isNewExpression(value)
+        )
+            return BINDING_DEFINED;
+        if (ts.isPropertyAccessExpression(value) || ts.isElementAccessExpression(value)) {
+            const key = ts.isPropertyAccessExpression(value)
+                ? value.name.text
+                : this.elementKey(value.argumentExpression);
+            const owner = this.resolveInstance(value.expression);
+            if (owner && key != null) return this.bindingProperty(owner, key)?.valueExpression;
+        }
+        // Type annotations and mutable initializers are not a runtime value snapshot.
+        if (this.isProvenClean(value) && this.hasPrimitiveType(value)) {
+            const type = this.checker.getTypeAtLocation(value);
+            const members = type.isUnion() ? type.types : [type];
+            if (
+                members.every(
+                    (member) =>
+                        !(
+                            member.flags &
+                            (ts.TypeFlags.Undefined | ts.TypeFlags.Void | ts.TypeFlags.Any | ts.TypeFlags.Unknown)
                         ),
-                    );
-                    state.set(sym, stepped);
-                }
-            }
+                )
+            )
+                return BINDING_DEFINED;
         }
+        return undefined;
     }
 
-    /**
-     * Preserve index-specific instance identity and tracked array element taint.
-     * Untracked aggregate taint remains conservative; nested targets are skipped.
-     */
-    private analyzeArrayDestructuring(
-        pattern: ts.ArrayBindingPattern,
-        sourceTaints: TaintValue[] | undefined,
-        sourceInstance: InstanceState | undefined,
-        state: TaintState,
-    ): void {
-        for (let i = 0; i < pattern.elements.length; i++) {
-            const element = pattern.elements[i];
-            if (ts.isBindingElement(element) && ts.isIdentifier(element.name)) {
-                const bindingName = element.name;
-                const sym = this.checker.getSymbolAtLocation(bindingName);
-                if (sym) {
-                    const selected =
-                        sourceInstance && this.hasHostType(sourceInstance, "Array")
-                            ? this.arrayElementTaints(sourceInstance, String(i), sourceTaints)
-                            : sourceTaints;
-                    if (selected) {
-                        const stepped = selected.map((t) =>
-                            propagate(
-                                t,
-                                {
-                                    kind: "destructuring",
-                                    location: this.nodeLocation(element),
-                                    description: `array-destructured into '${bindingName.text}'`,
-                                },
-                                this.metrics,
-                            ),
-                        );
-                        state.set(sym, stepped);
-                    }
-                    if (sourceInstance) {
-                        const elementInstance = this.getElementInstance(sourceInstance, String(i));
-                        if (elementInstance) {
-                            this.instanceFieldState.set(sym, elementInstance);
-                        }
-                    }
+    private bindingProperty(owner: InstanceState, key: string): InstanceState | undefined {
+        const array = this.hasHostType(owner, "Array");
+        const slot = array ? `$taint:${key}` : `${BINDING_PROPERTY}${key}`;
+        const stored = owner.elementInstances.get(slot);
+        const fieldTaints = array
+            ? []
+            : [...owner.fields].filter(([field]) => field.getName() === key).flatMap(([, taints]) => taints);
+        const payload =
+            stored && fieldTaints.length
+                ? {
+                      ...stored,
+                      valueTaints: [...(stored.valueTaints ?? []), ...fieldTaints],
+                      valueExpression: stored.valueTaints?.length ? stored.valueExpression : undefined,
+                  }
+                : stored;
+        const wildcard = array ? owner.elementInstances.get("$taint:*") : undefined;
+        if (wildcard)
+            return { ...mergeInstanceStates([...(payload ? [payload] : []), wildcard])!, valueExpression: undefined };
+        const selected =
+            payload ??
+            (owner.elementInstances.has(array ? BINDING_ARRAY_SHAPE : BINDING_OBJECT_SHAPE)
+                ? missingBindingPayload(owner, slot)
+                : undefined);
+        const defined = selected?.elementInstances.get(BINDING_VALUE_STATE);
+        return array && selected && defined ? { ...selected, valueExpression: defined.valueExpression } : selected;
+    }
+
+    private bindingProvenance(values: readonly TaintValue[], incoming: readonly TaintValue[]): TaintValue[] {
+        if (!values.length || !incoming.length) return values.slice();
+        const byFact = new Map<string, TaintValue>();
+        for (const taint of incoming) {
+            const key = this.taintFactKey(taint);
+            const existing = byFact.get(key);
+            if (!existing || existing.chainLength < taint.chainLength) byFact.set(key, taint);
+        }
+        return values.map((taint) => {
+            const candidate = byFact.get(this.taintFactKey(taint));
+            return candidate && candidate.chainLength >= taint.chainLength ? candidate : taint;
+        });
+    }
+
+    private selectBindingProperty(
+        name: ts.BindingName | ts.ObjectLiteralExpression | ts.ArrayLiteralExpression,
+        key: string | undefined,
+        taints: TaintValue[] | undefined,
+        instance: InstanceState | undefined,
+    ): { taints?: TaintValue[]; instance?: InstanceState; defined?: ts.Expression } {
+        const array = ts.isArrayBindingPattern(name) || ts.isArrayLiteralExpression(name);
+        const payload = instance && key != null ? this.bindingProperty(instance, key) : undefined;
+        let selectedTaints = payload ? payload.valueTaints?.slice() : taints;
+        let selectedInstance = payload?.elementInstances.get("$value");
+        if (key != null && !array) {
+            const incoming = taints && TaintTracker.taintsForAggregateProperty(taints, key);
+            selectedTaints = payload ? this.bindingProvenance(selectedTaints ?? [], incoming ?? []) : incoming;
+            const property = this.checker.getTypeAtLocation(name).getProperty(key);
+            selectedInstance ??= property && instance ? this.getInstanceReference(instance, property) : undefined;
+            selectedInstance ??= instance?.elementInstances.get(key);
+        } else if (instance) {
+            selectedInstance ??= this.getElementInstance(instance, key);
+            if (this.hasHostType(instance, "Array")) selectedTaints = this.arrayElementTaints(instance, key, taints);
+        }
+        return { taints: selectedTaints, instance: selectedInstance, defined: payload?.valueExpression };
+    }
+
+    private bindingRest(
+        array: boolean,
+        start: number,
+        excluded: Set<string>,
+        taints: TaintValue[] | undefined,
+        instance: InstanceState | undefined,
+    ): { taints?: TaintValue[]; instance?: InstanceState } {
+        const rest = createInstanceState();
+        if (array) rest.apiTypes = ["Array"];
+        if (instance) {
+            for (const [property, values] of instance.fields) {
+                if (!array && !excluded.has(property.getName())) rest.fields.set(property, values);
+            }
+            for (const [property, nested] of instance.fieldInstances) {
+                if (!array && !excluded.has(property.getName())) rest.fieldInstances.set(property, nested);
+            }
+            for (const [key, value] of instance.elementInstances) {
+                if (!array) {
+                    const property = key.startsWith(BINDING_PROPERTY) ? key.slice(BINDING_PROPERTY.length) : key;
+                    if (!excluded.has(property)) rest.elementInstances.set(key, value);
+                } else {
+                    const numeric = key.startsWith("$taint:") ? key.slice(7) : key;
+                    if (/^\d+$/.test(numeric)) {
+                        if (Number(numeric) >= start)
+                            rest.elementInstances.set(
+                                `${key.startsWith("$taint:") ? "$taint:" : ""}${Number(numeric) - start}`,
+                                value,
+                            );
+                    } else if (["*", "$taint:*", BINDING_ARRAY_SHAPE].includes(key))
+                        rest.elementInstances.set(key, value);
                 }
             }
+            if (array && instance.taintedElementsFromIndex != null) {
+                rest.taintedElementsFromIndex = Math.max(0, instance.taintedElementsFromIndex - start);
+                rest.valueTaints = instance.valueTaints;
+            }
         }
+        const selected =
+            array && instance && this.hasHostType(instance, "Array")
+                ? this.arrayElementTaints(rest, undefined, taints)
+                : taints?.filter(
+                      (taint) => !taint.aggregatePropertyPath?.length || !excluded.has(taint.aggregatePropertyPath[0]),
+                  );
+        return { taints: selected, instance: rest };
     }
 
     private bindDestructuring(
@@ -1595,14 +1703,18 @@ export class TaintTracker {
         state: TaintState,
     ): void {
         if (ts.isIdentifier(name)) {
-            const symbol = this.checker.getSymbolAtLocation(name);
+            const symbol = ts.isShorthandPropertyAssignment(name.parent)
+                ? this.checker.getShorthandAssignmentValueSymbol(name.parent)
+                : this.checker.getSymbolAtLocation(name);
             if (!symbol) return;
             if (taints?.length) state.set(symbol, taints);
             else state.delete(symbol);
+            this.cleanBindings.delete(symbol);
             if (instance) this.instanceFieldState.set(symbol, instance);
             else this.instanceFieldState.delete(symbol);
             return;
         }
+        const excluded = new Set<string>();
         for (let index = 0; index < name.elements.length; index++) {
             const element = name.elements[index];
             if (!ts.isBindingElement(element)) continue;
@@ -1613,24 +1725,14 @@ export class TaintTracker {
                   : ts.isIdentifier(element.name)
                     ? element.name.text
                     : undefined;
-            let selectedTaints = taints;
-            let selectedInstance: InstanceState | undefined;
-            if (!element.dotDotDotToken) {
-                if (ts.isObjectBindingPattern(name) && key != null) {
-                    selectedTaints = taints && TaintTracker.taintsForAggregateProperty(taints, key);
-                    const symbol = this.checker.getTypeAtLocation(name).getProperty(key);
-                    selectedInstance = symbol ? instance?.fieldInstances.get(symbol) : undefined;
-                    selectedInstance ??=
-                        instance && [...instance.fieldInstances].find(([field]) => field.getName() === key)?.[1];
-                } else if (instance) {
-                    selectedInstance = this.getElementInstance(instance, key);
-                    if (this.hasHostType(instance, "Array"))
-                        selectedTaints = this.arrayElementTaints(instance, key, taints);
-                }
-            } else {
-                selectedInstance = instance;
-            }
-            const stepped = selectedTaints?.map((taint) =>
+            if (element.propertyName && ts.isComputedPropertyName(element.propertyName))
+                this.analyzeExpression(element.propertyName.expression, state);
+            const selected = element.dotDotDotToken
+                ? this.bindingRest(ts.isArrayBindingPattern(name), index, excluded, taints, instance)
+                : this.selectBindingProperty(name, key, taints, instance);
+            if (key != null) excluded.add(key);
+            const value = this.analyzeBindingDefault(element.initializer, selected, state);
+            const stepped = value.taints?.map((taint) =>
                 propagate(
                     taint,
                     {
@@ -1641,7 +1743,88 @@ export class TaintTracker {
                     this.metrics,
                 ),
             );
-            this.bindDestructuring(element.name, stepped, selectedInstance, state);
+            this.bindDestructuring(element.name, stepped, value.instance, state);
+        }
+    }
+
+    private analyzeBindingDefault(
+        initializer: ts.Expression | undefined,
+        selected: { taints?: TaintValue[]; instance?: InstanceState; defined?: ts.Expression },
+        state: TaintState,
+    ): { taints?: TaintValue[]; instance?: InstanceState } {
+        if (!initializer || selected.defined === BINDING_DEFINED) return selected;
+        if (selected.instance) this.expressionInstanceState.set(initializer, selected.instance);
+        else this.expressionInstanceState.delete(initializer);
+        const skipped = selected.defined !== BINDING_UNDEFINED ? this.captureLoopAnalysisState(state) : undefined;
+        const defaultTaints = this.analyzeExpression(initializer, state);
+        const defaultInstance = this.resolveValueInstance(initializer, state);
+        if (defaultInstance) this.expressionInstanceState.set(initializer, defaultInstance);
+        else this.expressionInstanceState.delete(initializer);
+        if (!skipped) return { taints: defaultTaints, instance: defaultInstance };
+        this.restoreLoopAnalysisState(
+            this.mergeLoopAnalysisStates(skipped, this.captureLoopAnalysisState(state)),
+            state,
+        );
+        return {
+            taints: [...(selected.taints ?? []), ...(defaultTaints ?? [])],
+            instance: this.expressionInstanceState.get(initializer),
+        };
+    }
+
+    private assignBindingTarget(
+        target: ts.Expression,
+        taints: TaintValue[] | undefined,
+        instance: InstanceState | undefined,
+        state: TaintState,
+    ): void {
+        const value = unwrapExpression(target);
+        if (ts.isIdentifier(value)) {
+            this.bindDestructuring(value, taints, instance, state);
+        } else if (ts.isPropertyAccessExpression(value)) {
+            this.analyzeExpression(value.expression, state);
+            this.assignPropertyTaint(value, taints, state, value);
+            this.assignPropertyInstance(value, instance);
+            if (taints) this.checkAssignmentSink(value, taints);
+        } else if (ts.isElementAccessExpression(value)) {
+            this.analyzeExpression(value.expression, state);
+            this.analyzeExpression(value.argumentExpression, state);
+            this.assignElementInstance(value, instance, taints);
+            if (taints) this.checkAssignmentSink(value, taints);
+        } else if (ts.isObjectLiteralExpression(value) || ts.isArrayLiteralExpression(value)) {
+            const array = ts.isArrayLiteralExpression(value);
+            const elements = array ? value.elements : value.properties;
+            const excluded = new Set<string>();
+            elements.forEach((element, index) => {
+                if (ts.isOmittedExpression(element)) return;
+                const rest = ts.isSpreadElement(element) || ts.isSpreadAssignment(element);
+                const target = rest
+                    ? element.expression
+                    : ts.isPropertyAssignment(element)
+                      ? element.initializer
+                      : element;
+                const key = array
+                    ? String(index)
+                    : ts.isPropertyAssignment(element) || ts.isShorthandPropertyAssignment(element)
+                      ? this.propertyName(element.name)
+                      : undefined;
+                const selected = rest
+                    ? this.bindingRest(array, index, excluded, taints, instance)
+                    : this.selectBindingProperty(value, key, taints, instance);
+                if (key != null) excluded.add(key);
+                let destination: ts.Expression;
+                let initializer: ts.Expression | undefined;
+                if (ts.isShorthandPropertyAssignment(target)) {
+                    destination = target.name;
+                    initializer = target.objectAssignmentInitializer;
+                } else if (ts.isBinaryExpression(target) && target.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+                    destination = target.left;
+                    initializer = target.right;
+                } else {
+                    destination = target as ts.Expression;
+                }
+                const bound = this.analyzeBindingDefault(initializer, selected, state);
+                this.assignBindingTarget(destination, bound.taints, bound.instance, state);
+            });
         }
     }
 
@@ -1741,10 +1924,20 @@ export class TaintTracker {
             return taints;
         }
 
-        // `void` discards its value, not the operand's calls and side effects.
-        if (ts.isVoidExpression(expr)) {
-            this.analyzeExpression(expr.expression, state);
-            return undefined; // `void` always evaluates to undefined
+        if (ts.isVoidExpression(expr) || ts.isTypeOfExpression(expr) || ts.isDeleteExpression(expr)) {
+            const operand = unwrapExpression(expr.expression);
+            if (ts.isDeleteExpression(expr) && ts.isElementAccessExpression(operand)) {
+                this.analyzeExpression(operand.expression, state);
+                this.analyzeExpression(operand.argumentExpression, state);
+            } else if (ts.isDeleteExpression(expr) && ts.isPropertyAccessExpression(operand)) {
+                this.analyzeExpression(operand.expression, state);
+            } else {
+                this.analyzeExpression(operand, state);
+            }
+            if (ts.isDeleteExpression(expr)) this.deleteBindingProperty(operand, state);
+            this.cleanExpressions.add(expr);
+            if (this.nonReturningExpressions.has(operand)) this.nonReturningExpressions.add(expr);
+            return undefined;
         }
 
         if (ts.isAsExpression(expr) || ts.isTypeAssertionExpression(expr) || ts.isSatisfiesExpression(expr)) {
@@ -2072,6 +2265,7 @@ export class TaintTracker {
 
         const receiverInstance = this.resolveInstance(expr.expression.expression);
         if (receiverInstance) {
+            this.invalidateBindingMetadata(receiverInstance);
             if (this.hasHostType(receiverInstance, "Array")) {
                 this.storeHostValue(
                     receiverInstance,
@@ -2545,6 +2739,14 @@ export class TaintTracker {
 
         const sourceTaint = this.checkPropertySource(expr);
         if (sourceTaint) return [sourceTaint];
+        const binding = this.resolveInstance(expr.expression)?.elementInstances.get(
+            `${BINDING_PROPERTY}${expr.name.text}`,
+        );
+        if (binding)
+            return this.bindingProvenance(
+                [...(binding.valueTaints ?? []), ...(this.getInstanceFieldTaint(expr) ?? [])],
+                objectTaints ? TaintTracker.taintsForAggregateProperty(objectTaints, expr.name.text) : [],
+            );
         const stringField = this.resolveInstance(expr.expression)?.elementInstances.get(expr.name.text);
         if (stringField) return stringField.valueTaints?.slice();
         if (expr.name.text === "length" && this.hasHostType(this.resolveInstance(expr.expression), "Array")) {
@@ -2622,6 +2824,17 @@ export class TaintTracker {
             return this.arrayElementTaints(container!, this.elementKey(expr.argumentExpression), objectTaints);
         }
         const key = this.elementKey(expr.argumentExpression);
+        const binding = key != null ? container?.elementInstances.get(`${BINDING_PROPERTY}${key}`) : undefined;
+        if (binding)
+            return this.bindingProvenance(
+                [
+                    ...(binding.valueTaints ?? []),
+                    ...[...container!.fields]
+                        .filter(([property]) => property.getName() === key)
+                        .flatMap(([, taints]) => taints),
+                ],
+                objectTaints ? TaintTracker.taintsForAggregateProperty(objectTaints, key!) : [],
+            );
         const field = key != null ? container?.elementInstances.get(key) : undefined;
         if (field?.valueTaints) return field.valueTaints.slice();
 
@@ -3444,6 +3657,18 @@ export class TaintTracker {
                 );
             let comparatorIncomplete = false;
             if (callback && (elements.length > 1 || elements.some((element) => element.unknownSpread))) {
+                const originalBindings = elements.flatMap((element) =>
+                    element.instance
+                        ? [
+                              {
+                                  owner: element.instance,
+                                  values: [...element.instance.elementInstances].filter(([key]) =>
+                                      key.startsWith(BINDING_PROPERTY),
+                                  ),
+                              },
+                          ]
+                        : [],
+                );
                 const combined: CallArgument = {
                     expression: callee.expression,
                     taints: elements.flatMap((element) => element.taints ?? []),
@@ -3473,6 +3698,9 @@ export class TaintTracker {
                     comparatorIncomplete ||= !first || first.truncated === true || !second || second.truncated === true;
                 }
                 // Comparator writes to the receiver are alternatives to its original contents.
+                for (const { owner, values } of originalBindings) {
+                    for (const [key, value] of values) this.storeHostValue(owner, key, value);
+                }
                 elements.push(...this.flatElements(output, receiverTaints, callee.expression));
             }
             if (
@@ -4139,9 +4367,14 @@ export class TaintTracker {
         }
 
         // Only sort eligibility consumes this escape marker; other host models retain their contracts.
-        for (const instance of argInstances) this.markSortEscape(instance);
+        for (const instance of argInstances) {
+            this.markSortEscape(instance);
+            if (instance) this.invalidateBindingMetadata(instance);
+        }
         if (ts.isPropertyAccessExpression(expr.expression) || ts.isElementAccessExpression(expr.expression)) {
-            this.markSortEscape(this.resolveInstance(expr.expression.expression));
+            const instance = this.resolveInstance(expr.expression.expression);
+            this.markSortEscape(instance);
+            if (instance) this.invalidateBindingMetadata(instance);
         }
         // Unresolved call passthrough: if we can't see inside the function,
         // propagate taint from arguments and receiver to the return value.
@@ -4758,6 +4991,8 @@ export class TaintTracker {
                     // Check if LHS is a sink (assignment sink, e.g., webview.html = tainted)
                     if (rightTaints) this.checkAssignmentSink(expr.left, rightTaints);
                 }
+            } else if (ts.isObjectLiteralExpression(expr.left) || ts.isArrayLiteralExpression(expr.left)) {
+                this.assignBindingTarget(expr.left, rightTaints, rightInstance, state);
             } else if (ts.isPropertyAccessExpression(expr.left)) {
                 this.assignPropertyTaint(expr.left, rightTaints, state, expr);
                 this.assignPropertyInstance(expr.left, rightInstance);
@@ -5451,23 +5686,29 @@ export class TaintTracker {
 
     private analyzeObjectLiteral(expr: ts.ObjectLiteralExpression, state: TaintState): TaintValue[] | undefined {
         const allTaints: TaintValue[] = [];
-        // Instances and function values held by properties, such as the closure in
-        // `{getConfig: () => ...}` that is later called as `options.getConfig()`.
+        // Properties hold value snapshots and shallow object/function aliases.
         const container = createInstanceState();
+        container.elementInstances.set(BINDING_OBJECT_SHAPE, this.hostValue());
         for (const prop of expr.properties) {
             if (ts.isPropertyAssignment(prop)) {
+                if (ts.isComputedPropertyName(prop.name)) this.analyzeExpression(prop.name.expression, state);
                 const taints = this.analyzeExpression(prop.initializer, state);
-                if (taints) {
-                    allTaints.push(...this.stampObjectProperty(taints, this.propertyName(prop.name), prop));
-                }
-                const instance = this.resolveInstance(prop.initializer);
+                const name = this.propertyName(prop.name);
+                const stamped = taints && this.stampObjectProperty(taints, name, prop);
+                if (stamped) allTaints.push(...stamped);
+                const instance = this.resolveValueInstance(prop.initializer, state);
                 const property = this.checker.getSymbolAtLocation(prop.name);
                 if (instance && property) container.fieldInstances.set(property, instance);
+                this.recordBindingProperty(
+                    container,
+                    name,
+                    stamped && name != null ? TaintTracker.taintsForAggregateProperty(stamped, name) : stamped,
+                    instance,
+                    prop.initializer,
+                );
             } else if (ts.isSpreadAssignment(prop)) {
                 const taints = this.analyzeExpression(prop.expression, state);
-                if (taints) {
-                    // Spreading an object copies its properties without adding
-                    // another component to their tracked property paths.
+                if (taints)
                     allTaints.push(
                         ...taints.map((t) =>
                             propagate(
@@ -5475,32 +5716,115 @@ export class TaintTracker {
                                 {
                                     kind: "spread",
                                     location: this.nodeLocation(prop),
-                                    description: `spread into object literal`,
+                                    description: "spread into object literal",
                                 },
                                 this.metrics,
                             ),
                         ),
                     );
+                const source = this.resolveInstance(prop.expression);
+                if (!source?.elementInstances.has(BINDING_OBJECT_SHAPE))
+                    container.elementInstances.delete(BINDING_OBJECT_SHAPE);
+                if (source) {
+                    for (const [property, instance] of source.fieldInstances)
+                        container.fieldInstances.set(property, instance);
+                    for (const [key, value] of source.elementInstances) {
+                        if (key.startsWith(BINDING_PROPERTY)) container.elementInstances.set(key, value);
+                    }
                 }
             } else if (ts.isShorthandPropertyAssignment(prop)) {
-                // getSymbolAtLocation on a shorthand name resolves to the object
-                // literal's own property symbol, not the variable being read, so
-                // it never matches anything in the taint state.
+                // Shorthand names have a property symbol distinct from the binding read.
                 const sym =
                     this.checker.getShorthandAssignmentValueSymbol(prop) ?? this.checker.getSymbolAtLocation(prop.name);
-                if (sym) {
-                    const taints = state.get(sym);
-                    if (taints) {
-                        allTaints.push(...this.stampObjectProperty(taints, prop.name.text, prop));
-                    }
-                    const instance = this.instanceFieldState.get(sym);
-                    const property = this.checker.getSymbolAtLocation(prop.name);
-                    if (instance && property) container.fieldInstances.set(property, instance);
-                }
+                const taints = sym ? state.get(sym)?.slice() : undefined;
+                const stamped = taints && this.stampObjectProperty(taints, prop.name.text, prop);
+                if (stamped) allTaints.push(...stamped);
+                const instance = sym ? this.instanceFieldState.get(sym) : undefined;
+                const property = this.checker.getSymbolAtLocation(prop.name);
+                if (instance && property) container.fieldInstances.set(property, instance);
+                this.recordBindingProperty(
+                    container,
+                    prop.name.text,
+                    stamped && TaintTracker.taintsForAggregateProperty(stamped, prop.name.text),
+                    instance,
+                    prop.name,
+                );
+            } else {
+                container.elementInstances.delete(BINDING_OBJECT_SHAPE);
             }
         }
         this.expressionInstanceState.set(expr, container);
         return allTaints.length > 0 ? allTaints : undefined;
+    }
+
+    private recordBindingProperty(
+        owner: InstanceState,
+        key: string | undefined,
+        taints: readonly TaintValue[] | undefined,
+        instance: InstanceState | undefined,
+        expression?: ts.Expression,
+    ): void {
+        if (key == null) {
+            this.invalidateBindingMetadata(owner);
+            return;
+        }
+        const array = this.hasHostType(owner, "Array");
+        const slot = array ? `$taint:${key}` : `${BINDING_PROPERTY}${key}`;
+        const defined = expression && this.bindingValueExpression(expression);
+        const payload = this.hostValue(taints, instance, array ? expression : defined);
+        if (array) payload.elementInstances.set(BINDING_VALUE_STATE, this.hostValue([], undefined, defined));
+        owner.elementInstances.set(slot, payload);
+    }
+
+    private invalidateBindingMetadata(owner: InstanceState, seen = new Set<InstanceState>()): void {
+        if (seen.has(owner)) return;
+        seen.add(owner);
+        owner.elementInstances.delete(BINDING_OBJECT_SHAPE);
+        owner.elementInstances.delete(BINDING_ARRAY_SHAPE);
+        for (const [key, value] of owner.elementInstances) {
+            if (isBindingPayload(key)) {
+                const payload: InstanceState = {
+                    ...value,
+                    valueExpression: undefined,
+                    elementInstances: new Map(value.elementInstances),
+                };
+                if (payload.elementInstances.has(BINDING_VALUE_STATE))
+                    payload.elementInstances.set(BINDING_VALUE_STATE, this.hostValue());
+                owner.elementInstances.set(key, payload);
+            } else this.invalidateBindingMetadata(value, seen);
+        }
+        for (const value of owner.fieldInstances.values()) this.invalidateBindingMetadata(value, seen);
+    }
+
+    private deleteBindingProperty(target: ts.Expression, state: TaintState): void {
+        if (!ts.isPropertyAccessExpression(target) && !ts.isElementAccessExpression(target)) return;
+        const owner = this.resolveInstance(target.expression);
+        if (!owner) return;
+        const key = ts.isPropertyAccessExpression(target)
+            ? target.name.text
+            : this.elementKey(target.argumentExpression);
+        if (key == null) {
+            this.invalidateBindingMetadata(owner);
+            return;
+        }
+        // A class or unknown prototype can expose an inherited value after deletion.
+        if (!owner.elementInstances.has(BINDING_OBJECT_SHAPE) && !owner.elementInstances.has(BINDING_ARRAY_SHAPE)) {
+            this.invalidateBindingMetadata(owner);
+            return;
+        }
+        for (const symbol of [...owner.fields.keys()]) {
+            if (symbol.getName() === key) owner.fields.delete(symbol);
+        }
+        for (const symbol of [...owner.fieldInstances.keys()]) {
+            if (symbol.getName() === key) owner.fieldInstances.delete(symbol);
+        }
+        owner.elementInstances.delete(key);
+        const slot = this.hasHostType(owner, "Array") ? `$taint:${key}` : `${BINDING_PROPERTY}${key}`;
+        owner.elementInstances.set(slot, this.hostValue([], undefined, BINDING_UNDEFINED));
+        if (ts.isPropertyAccessExpression(target)) {
+            const symbol = this.getThisPropertySymbol(target) ?? this.getThisAliasPropertySymbol(target);
+            if (symbol) state.delete(symbol);
+        }
     }
 
     /**
@@ -5534,7 +5858,11 @@ export class TaintTracker {
     }
 
     private propertyName(name: ts.PropertyName): string | undefined {
-        if (ts.isIdentifier(name) || ts.isStringLiteralLike(name)) return name.text;
+        if (ts.isIdentifier(name) || ts.isStringLiteralLike(name) || ts.isNumericLiteral(name)) return name.text;
+        if (ts.isComputedPropertyName(name)) {
+            const expression = unwrapExpression(name.expression);
+            if (ts.isStringLiteralLike(expression) || ts.isNumericLiteral(expression)) return expression.text;
+        }
         return undefined;
     }
 
@@ -5706,6 +6034,7 @@ export class TaintTracker {
         const allTaints: TaintValue[] = [];
         const container = createInstanceState();
         container.apiTypes = ["Array"];
+        container.elementInstances.set(BINDING_ARRAY_SHAPE, this.hostValue());
         const nestedShellCommandIndices = this.findNestedShellCommandIndices(expr);
         for (let i = 0; i < expr.elements.length; i++) {
             const element = expr.elements[i];
@@ -5740,9 +6069,10 @@ export class TaintTracker {
                         ),
                     ),
                 );
-            container.elementInstances.set(`$taint:${i}`, this.hostValue(taints, undefined, element));
             const instance = this.resolveValueInstance(element, state);
+            this.recordBindingProperty(container, String(i), taints, instance, element);
             if (instance) container.elementInstances.set(String(i), instance);
+            if (ts.isSpreadElement(element)) this.invalidateBindingMetadata(container);
         }
         this.expressionInstanceState.set(expr, container);
         return allTaints.length > 0 ? allTaints : undefined;
@@ -5886,6 +6216,7 @@ export class TaintTracker {
         const container = this.resolveInstance(target.expression);
         const key = this.elementKey(target.argumentExpression);
         if (!container) return;
+        this.recordBindingProperty(container, key, taints, instance);
         if (this.hasHostType(container, "Array")) {
             const payload = this.hostValue(taints);
             if (key == null) this.storeHostValue(container, "$taint:*", payload);
@@ -5929,6 +6260,19 @@ export class TaintTracker {
         const directThisProperty = this.getThisPropertySymbol(target) || this.getThisAliasPropertySymbol(target);
         const receiver = this.assignmentReceiver(target.expression);
         const property = directThisProperty ?? (receiver ? this.resolveSymbol(target.name) : undefined);
+        if (receiver) {
+            const expression =
+                ts.isBinaryExpression(assignment) && assignment.operatorToken.kind === ts.SyntaxKind.EqualsToken
+                    ? assignment.right
+                    : undefined;
+            this.recordBindingProperty(
+                receiver,
+                target.name.text,
+                taints,
+                expression && this.resolveValueInstance(expression, state),
+                expression,
+            );
+        }
         if (!property) {
             if (receiver) receiver.elementInstances.set(target.name.text, this.hostValue(taints));
             return;
@@ -5963,6 +6307,14 @@ export class TaintTracker {
         if (!receiver) return;
 
         const property = this.resolveSymbol(target.name);
+        const slot = `${BINDING_PROPERTY}${target.name.text}`;
+        const payload = receiver.elementInstances.get(slot);
+        if (payload) {
+            const value = { ...payload, elementInstances: new Map(payload.elementInstances) };
+            if (instance) value.elementInstances.set("$value", instance);
+            else value.elementInstances.delete("$value");
+            receiver.elementInstances.set(slot, value);
+        }
         if (!property) {
             if (instance) receiver.elementInstances.set(target.name.text, instance);
             return;
@@ -6119,6 +6471,10 @@ export class TaintTracker {
                 ? [...container.elementInstances].filter(([key]) => !key.startsWith("$")).map(([, value]) => value)
                 : [
                       container.elementInstances.get(key),
+                      container.elementInstances.get(`${BINDING_PROPERTY}${key}`)?.elementInstances.get("$value"),
+                      ...[...container.fieldInstances]
+                          .filter(([property]) => property.getName() === key)
+                          .map(([, value]) => value),
                       container.elementInstances.get(TaintTracker.UNKNOWN_ELEMENT),
                   ].filter((value): value is InstanceState => value != null);
         return mergeInstanceStates(candidates);
