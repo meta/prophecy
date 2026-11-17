@@ -211,6 +211,17 @@ interface LoopAnalysisState {
     currentThisInstance?: InstanceState;
     expressionInstances: Map<ts.Expression, InstanceState>;
     cleanBindings: Set<ts.Symbol>;
+    completionValues?: Map<object, InstanceState>;
+}
+
+interface PendingCompletion {
+    kind: "return" | "throw" | "break" | "continue" | "stop";
+    environment: LoopAnalysisState;
+    taints: TaintValue[];
+    unknown?: boolean;
+    instanceUnknown?: boolean;
+    valueKey?: object;
+    breakTarget?: { kind: "loop" | "switch"; exits: LoopAnalysisState[] };
 }
 
 export function createInstanceState(): InstanceState {
@@ -632,6 +643,9 @@ export class TaintTracker {
     private mayThrow = false;
     private throwTaints: TaintValue[] = [];
     private throwInstances: InstanceState[] = [];
+    private completionCollector?: PendingCompletion[];
+    private completionValues = new Map<object, InstanceState>();
+    private completionBreakDepth = 0;
 
     /**
      * Set of variable symbols that are aliases for `this`.
@@ -823,37 +837,41 @@ export class TaintTracker {
             this.analyzeExpression(stmt.expression, state);
             if (this.nonReturningExpressions.has(unwrapExpression(stmt.expression))) return false;
         } else if (ts.isReturnStatement(stmt)) {
-            if (stmt.expression) {
-                const taints = this.analyzeExpression(stmt.expression, state);
-                if (taints) {
-                    returnTaints.push(...taints);
-                }
-                const instance = this.resolveValueInstance(stmt.expression, state);
+            const taints = stmt.expression ? this.analyzeExpression(stmt.expression, state) : undefined;
+            const instance = stmt.expression ? this.resolveValueInstance(stmt.expression, state) : undefined;
+            const canReturn = !stmt.expression || !this.nonReturningExpressions.has(unwrapExpression(stmt.expression));
+            if (canReturn) {
+                const unknown = !!stmt.expression && !taints?.length && !this.isProvenClean(stmt.expression);
+                const instanceUnknown = !!stmt.expression && !instance && !this.hasPrimitiveType(stmt.expression);
+                returnTaints.push(...(taints ?? []));
                 if (instance) returnInstances.push(instance);
-                this.returnInstanceUnknown ||=
-                    !instance &&
-                    !this.hasPrimitiveType(stmt.expression) &&
-                    !this.nonReturningExpressions.has(unwrapExpression(stmt.expression));
-                this.returnUnknown ||= !taints?.length && !this.isProvenClean(stmt.expression);
+                this.returnUnknown ||= unknown;
+                this.returnInstanceUnknown ||= instanceUnknown;
+                this.hasNormalReturn = true;
+                this.recordCompletion("return", state, taints, instance, unknown, instanceUnknown);
             }
-            this.hasNormalReturn ||=
-                !stmt.expression || !this.nonReturningExpressions.has(unwrapExpression(stmt.expression));
             return false;
         } else if (ts.isThrowStatement(stmt)) {
+            const taints = stmt.expression ? this.analyzeExpression(stmt.expression, state) : undefined;
+            const instance = stmt.expression ? this.resolveValueInstance(stmt.expression, state) : undefined;
             this.mayThrow = true;
-            if (stmt.expression) {
-                this.throwTaints.push(...(this.analyzeExpression(stmt.expression, state) ?? []));
-                const instance = this.resolveValueInstance(stmt.expression, state);
-                if (instance) this.throwInstances.push(instance);
-            }
+            this.throwTaints.push(...(taints ?? []));
+            if (instance) this.throwInstances.push(instance);
+            this.recordCompletion("throw", state, taints, instance);
             return false;
         } else if (ts.isBreakStatement(stmt)) {
             const target = this.breakTargets[this.breakTargets.length - 1];
-            if (!stmt.label && target?.kind === "switch") {
+            if (!stmt.label && this.completionCollector && this.breakTargets.length <= this.completionBreakDepth) {
+                this.recordCompletion("break", state);
+                this.completionCollector[this.completionCollector.length - 1].breakTarget = target;
+            } else if (!stmt.label && target?.kind === "switch") {
                 target.exits.push(this.captureLoopAnalysisState(state));
             }
             return false;
         } else if (ts.isContinueStatement(stmt)) {
+            if (!stmt.label && this.completionCollector && this.breakTargets.length <= this.completionBreakDepth) {
+                this.recordCompletion("continue", state);
+            }
             return false;
         } else if (ts.isIfStatement(stmt)) {
             this.analyzeExpression(stmt.expression, state);
@@ -913,34 +931,7 @@ export class TaintTracker {
         } else if (ts.isBlock(stmt)) {
             return this.analyzeStatementList(stmt.statements, state, returnTaints, returnInstances);
         } else if (ts.isTryStatement(stmt)) {
-            const before = { mayThrow: this.mayThrow, taints: this.throwTaints, instances: this.throwInstances };
-            this.mayThrow = false;
-            this.throwTaints = [];
-            this.throwInstances = [];
-            const tryFallsThrough = this.analyzeStatementList(
-                stmt.tryBlock.statements,
-                state,
-                returnTaints,
-                returnInstances,
-            );
-            const thrown = { mayThrow: this.mayThrow, taints: this.throwTaints, instances: this.throwInstances };
-            this.mayThrow = before.mayThrow || (!stmt.catchClause && thrown.mayThrow);
-            this.throwTaints = [...before.taints, ...(stmt.catchClause ? [] : thrown.taints)];
-            this.throwInstances = [...before.instances, ...(stmt.catchClause ? [] : thrown.instances)];
-            if (stmt.catchClause?.variableDeclaration)
-                this.bindDestructuring(
-                    stmt.catchClause.variableDeclaration.name,
-                    thrown.taints,
-                    mergeInstanceStates(thrown.instances),
-                    state,
-                );
-            const catchFallsThrough = stmt.catchClause
-                ? this.analyzeStatementList(stmt.catchClause.block.statements, state, returnTaints, returnInstances)
-                : true;
-            const finallyFallsThrough = stmt.finallyBlock
-                ? this.analyzeStatementList(stmt.finallyBlock.statements, state, returnTaints, returnInstances)
-                : true;
-            return finallyFallsThrough && (tryFallsThrough || catchFallsThrough);
+            return this.analyzeTryStatement(stmt, state, returnTaints, returnInstances);
         } else if (ts.isSwitchStatement(stmt)) {
             this.analyzeExpression(stmt.expression, state);
             const exits: LoopAnalysisState[] = [];
@@ -987,6 +978,146 @@ export class TaintTracker {
         }
 
         return true;
+    }
+
+    private recordCompletion(
+        kind: PendingCompletion["kind"],
+        state: TaintState,
+        taints: TaintValue[] = [],
+        instance?: InstanceState,
+        unknown?: boolean,
+        instanceUnknown?: boolean,
+    ): void {
+        if (!this.completionCollector) return;
+        const valueKey = instance ? {} : undefined;
+        // A separate root per completion preserves aliases across nested finalizers.
+        if (valueKey) this.completionValues.set(valueKey, instance!);
+        const environment = this.captureLoopAnalysisState(state);
+        if (valueKey) this.completionValues.delete(valueKey);
+        this.completionCollector.push({ kind, environment, taints, unknown, instanceUnknown, valueKey });
+    }
+
+    private resetCompletionSummary(): void {
+        this.hasNormalReturn = false;
+        this.returnUnknown = false;
+        this.returnInstanceUnknown = false;
+        this.mayThrow = false;
+        this.throwTaints = [];
+        this.throwInstances = [];
+    }
+
+    private analyzeTryStatement(
+        stmt: ts.TryStatement,
+        state: TaintState,
+        returnTaints: TaintValue[],
+        returnInstances: InstanceState[],
+    ): boolean {
+        const outerCollector = this.completionCollector;
+        const outerBreakDepth = this.completionBreakDepth;
+        this.completionBreakDepth = this.breakTargets.length;
+        const outer = {
+            hasNormalReturn: this.hasNormalReturn,
+            returnUnknown: this.returnUnknown,
+            returnInstanceUnknown: this.returnInstanceUnknown,
+            mayThrow: this.mayThrow,
+            throwTaints: this.throwTaints,
+            throwInstances: this.throwInstances,
+        };
+        const entry = this.captureLoopAnalysisState(state);
+        const tryCompletions: PendingCompletion[] = [];
+        this.completionCollector = tryCompletions;
+        this.resetCompletionSummary();
+        const tryFallsThrough = this.analyzeStatementList(stmt.tryBlock.statements, state, [], []);
+        const tryExit = this.captureLoopAnalysisState(state);
+        const normalExits = tryFallsThrough ? [tryExit] : [];
+        if (!tryFallsThrough && tryCompletions.length === 0) {
+            this.recordCompletion("stop", state);
+        }
+        const thrown = tryCompletions.filter((completion) => completion.kind === "throw");
+        let pending = tryCompletions.filter((completion) => !stmt.catchClause || completion.kind !== "throw");
+        if (stmt.catchClause) {
+            // Unknown calls can throw at unmodeled sites. Keep entry/exit alternatives
+            // alongside states captured at recognized exceptional completions.
+            const catchEntry = [entry, tryExit, ...thrown.map((completion) => completion.environment)].reduce(
+                (left, right) => this.mergeLoopAnalysisStates(left, right),
+            );
+            this.restoreLoopAnalysisState(catchEntry, state);
+            const catchCompletions: PendingCompletion[] = [];
+            this.completionCollector = catchCompletions;
+            this.resetCompletionSummary();
+            if (stmt.catchClause.variableDeclaration) {
+                this.bindDestructuring(
+                    stmt.catchClause.variableDeclaration.name,
+                    thrown.flatMap((completion) => completion.taints),
+                    mergeInstanceStates(
+                        thrown.flatMap((completion) => {
+                            const value = completion.valueKey && catchEntry.completionValues?.get(completion.valueKey);
+                            return value ? [value] : [];
+                        }),
+                    ),
+                    state,
+                );
+            }
+            const catchFallsThrough = this.analyzeStatementList(stmt.catchClause.block.statements, state, [], []);
+            if (catchFallsThrough) normalExits.push(this.captureLoopAnalysisState(state));
+            else if (catchCompletions.length === 0) this.recordCompletion("stop", state);
+            pending.push(...catchCompletions);
+        }
+
+        const finalNormalExits: LoopAnalysisState[] = [];
+        if (stmt.finallyBlock) {
+            const finalCompletions: PendingCompletion[] = [];
+            for (const alternative of [
+                ...normalExits.map((environment) => ({
+                    environment,
+                    completion: undefined as PendingCompletion | undefined,
+                })),
+                ...pending.map((completion) => ({ environment: completion.environment, completion })),
+            ]) {
+                this.restoreLoopAnalysisState(this.cloneLoopAnalysisState(alternative.environment), state);
+                this.completionCollector = finalCompletions;
+                this.resetCompletionSummary();
+                const fallsThrough = this.analyzeStatementList(stmt.finallyBlock.statements, state, [], []);
+                if (fallsThrough) {
+                    const environment = this.captureLoopAnalysisState(state);
+                    if (alternative.completion) finalCompletions.push({ ...alternative.completion, environment });
+                    else finalNormalExits.push(environment);
+                }
+            }
+            pending = finalCompletions;
+        } else {
+            finalNormalExits.push(...normalExits);
+        }
+
+        this.completionCollector = outerCollector;
+        this.completionBreakDepth = outerBreakDepth;
+        Object.assign(this, outer);
+        for (const completion of pending) {
+            const instance = completion.valueKey && completion.environment.completionValues?.get(completion.valueKey);
+            if (completion.kind === "return") {
+                this.hasNormalReturn = true;
+                this.returnUnknown ||= completion.unknown ?? false;
+                this.returnInstanceUnknown ||= completion.instanceUnknown ?? false;
+                returnTaints.push(...completion.taints);
+                if (instance) returnInstances.push(instance);
+            } else if (completion.kind === "throw") {
+                this.mayThrow = true;
+                this.throwTaints.push(...completion.taints);
+                if (instance) this.throwInstances.push(instance);
+            }
+            if (outerCollector) outerCollector.push(completion);
+            else if (completion.kind === "break" && completion.breakTarget?.kind === "switch") {
+                completion.breakTarget.exits.push(completion.environment);
+            }
+        }
+        const exits = finalNormalExits.length ? finalNormalExits : pending.map((completion) => completion.environment);
+        if (exits.length) {
+            this.restoreLoopAnalysisState(
+                exits.slice(1).reduce((left, right) => this.mergeLoopAnalysisStates(left, right), exits[0]),
+                state,
+            );
+        }
+        return finalNormalExits.length > 0;
     }
 
     private analyzeLoopStatement(
@@ -1131,6 +1262,7 @@ export class TaintTracker {
             currentThisInstance: this.currentThisInstance,
             expressionInstances: this.expressionInstanceState,
             cleanBindings: this.cleanBindings,
+            completionValues: this.completionValues,
         });
     }
 
@@ -1181,6 +1313,9 @@ export class TaintTracker {
             ),
             currentThisInstance: source.currentThisInstance ? cloneInstance(source.currentThisInstance) : undefined,
             cleanBindings: new Set(source.cleanBindings),
+            completionValues:
+                source.completionValues &&
+                new Map([...source.completionValues].map(([key, value]) => [key, cloneInstance(value)])),
         };
     }
 
@@ -1196,6 +1331,7 @@ export class TaintTracker {
         this.currentThisInstance = source.currentThisInstance;
         this.expressionInstanceState = source.expressionInstances;
         this.cleanBindings = source.cleanBindings;
+        this.completionValues = source.completionValues ?? new Map();
     }
 
     private mergeLoopAnalysisStates(a: LoopAnalysisState, b: LoopAnalysisState): LoopAnalysisState {
@@ -1312,6 +1448,26 @@ export class TaintTracker {
             const instance = left && right ? mergeInstances(left, right) : (left ?? right);
             if (instance) expressionInstances.set(expression, instance);
         }
+        const completionValues = new Map<object, InstanceState>();
+        const rebound = (instance: InstanceState): InstanceState => {
+            const origin = this.instanceOrigins.get(instance) ?? instance;
+            for (const [left, byRight] of mergedInstances) {
+                for (const [right, merged] of byRight) {
+                    if (
+                        (this.instanceOrigins.get(left) ?? left) === origin &&
+                        (this.instanceOrigins.get(right) ?? right) === origin
+                    )
+                        return merged;
+                }
+            }
+            return instance;
+        };
+        for (const key of new Set([...(a.completionValues?.keys() ?? []), ...(b.completionValues?.keys() ?? [])])) {
+            const left = a.completionValues?.get(key);
+            const right = b.completionValues?.get(key);
+            if (left && right) completionValues.set(key, mergeInstances(left, right));
+            else completionValues.set(key, rebound((left ?? right)!));
+        }
         return {
             taints: this.mergeLoopStates(a.taints, b.taints),
             instanceBindings,
@@ -1319,6 +1475,7 @@ export class TaintTracker {
             currentThisInstance,
             expressionInstances,
             cleanBindings: new Set([...a.cleanBindings].filter((symbol) => b.cleanBindings.has(symbol))),
+            completionValues,
         };
     }
 
@@ -1909,6 +2066,7 @@ export class TaintTracker {
                     this.throwTaints.push(...(rejected.valueTaints ?? []));
                     const instance = rejected.elementInstances.get("$value");
                     if (instance) this.throwInstances.push(instance);
+                    this.recordCompletion("throw", state, rejected.valueTaints?.slice(), instance);
                     if (!value && !this.hasUnknownPromiseSettlement(promise)) this.nonReturningExpressions.add(expr);
                 }
                 const instance = value?.elementInstances.get("$value");
@@ -2058,7 +2216,13 @@ export class TaintTracker {
             mayThrow: this.mayThrow,
             throwTaints: this.throwTaints,
             throwInstances: this.throwInstances,
+            collector: this.completionCollector,
+            values: this.completionValues,
+            breakDepth: this.completionBreakDepth,
         };
+        this.completionCollector = undefined;
+        this.completionValues = new Map();
+        this.completionBreakDepth = 0;
         this.hasNormalReturn = false;
         this.mayThrow = false;
         this.throwTaints = [];
@@ -2129,6 +2293,9 @@ export class TaintTracker {
             this.mayThrow = liveCompletion.mayThrow;
             this.throwTaints = liveCompletion.throwTaints;
             this.throwInstances = liveCompletion.throwInstances;
+            this.completionCollector = liveCompletion.collector;
+            this.completionValues = liveCompletion.values;
+            this.completionBreakDepth = liveCompletion.breakDepth;
         }
     }
 
@@ -4332,6 +4499,12 @@ export class TaintTracker {
                         this.mayThrow = true;
                         this.throwTaints.push(...(callResult.throwTaints ?? []));
                         this.throwInstances.push(...(callResult.throwInstances ?? []));
+                        this.recordCompletion(
+                            "throw",
+                            state,
+                            callResult.throwTaints,
+                            mergeInstanceStates(callResult.throwInstances ?? []),
+                        );
                     }
                     if (callResult.canReturn === false) this.nonReturningExpressions.add(expr);
                 }
@@ -4365,6 +4538,10 @@ export class TaintTracker {
                 if (!callResult.truncated && !returnUnknown) return undefined;
             }
         }
+
+        // Unresolved calls can throw after their arguments have been evaluated.
+        this.mayThrow = true;
+        this.recordCompletion("throw", state);
 
         // Only sort eligibility consumes this escape marker; other host models retain their contracts.
         for (const instance of argInstances) {
@@ -4755,6 +4932,7 @@ export class TaintTracker {
         const outcomes = [promise];
         for (const fn of executor?.functions ?? []) {
             if (!fn.declaration.body) continue;
+            const outcomeStart = outcomes.length;
             const endpoints = ["Promise.resolveCallback", "Promise.rejectCallback"].map((type) => {
                 const endpoint = createInstanceState();
                 endpoint.apiTypes = [type];
@@ -4793,10 +4971,19 @@ export class TaintTracker {
                 !promise.elementInstances.has("$fulfilled") &&
                 !promise.elementInstances.has("$rejected")
             ) {
+                const observedSettlement = outcomes
+                    .slice(outcomeStart)
+                    .some(
+                        (outcome) =>
+                            outcome.elementInstances.has("$fulfilled") || outcome.elementInstances.has("$rejected"),
+                    );
                 promise.elementInstances.set(
                     "$rejected",
                     this.hostValue(result.throwTaints, mergeInstanceStates(result.throwInstances ?? [])),
                 );
+                // A possible executor exception does not prove that an opaque callback cannot fulfill it later.
+                if (result.canReturn !== false && !observedSettlement)
+                    promise.elementInstances.set("$unknownReturn", this.hostValue());
             }
         }
         const merged = mergeInstanceStates(outcomes)!;
