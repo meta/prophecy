@@ -75,19 +75,24 @@ const MAX_LOOP_ITERATIONS = 16;
 // Binding metadata is boxed in reserved slots so container iteration cannot consume it.
 const BINDING_PROPERTY = "$property:";
 const BINDING_OBJECT_SHAPE = "$properties";
+const BINDING_UNKNOWN_VALUE = "$unknownBindingValue";
+const ENUMERATION_KEYS = "$enumerationKeys";
+const ENUMERATION_VALUE = "$enumerationValue";
 const BINDING_ARRAY_SHAPE = "$elements";
 const BINDING_VALUE_STATE = "$defined";
 const BINDING_DEFINED = ts.factory.createNumericLiteral(0);
 const BINDING_UNDEFINED = ts.factory.createVoidZero();
 
 function isBindingPayload(key: string): boolean {
-    return key.startsWith(BINDING_PROPERTY) || key.startsWith("$taint:");
+    return key.startsWith(BINDING_PROPERTY) || key.startsWith("$taint:") || key === ENUMERATION_VALUE;
 }
 
 function missingBindingPayload(owner: InstanceState, key: string): InstanceState {
     const value = createInstanceState();
-    const shape = key.startsWith(BINDING_PROPERTY) ? BINDING_OBJECT_SHAPE : BINDING_ARRAY_SHAPE;
+    const shape =
+        key.startsWith(BINDING_PROPERTY) || key === ENUMERATION_VALUE ? BINDING_OBJECT_SHAPE : BINDING_ARRAY_SHAPE;
     if (owner.elementInstances.has(shape)) value.valueExpression = BINDING_UNDEFINED;
+    else value.elementInstances.set(BINDING_UNKNOWN_VALUE, createInstanceState());
     if (key.startsWith("$taint:")) {
         const defined = createInstanceState();
         defined.valueExpression = value.valueExpression;
@@ -323,6 +328,21 @@ export function mergeInstanceStates(instances: InstanceState[]): InstanceState |
     return mergeInstanceStatesAtDepth(instances, 0);
 }
 
+/** A tracked alternative cannot prove absence on an unknown alternative of the same value. */
+function unknownBindingAlternative(instance: InstanceState): InstanceState {
+    const elements = new Map(instance.elementInstances);
+    elements.delete(BINDING_OBJECT_SHAPE);
+    elements.delete(BINDING_ARRAY_SHAPE);
+    elements.delete(ENUMERATION_KEYS);
+    for (const [key, payload] of elements) {
+        if (!isBindingPayload(key)) continue;
+        const values = new Map(payload.elementInstances).set(BINDING_UNKNOWN_VALUE, createInstanceState());
+        if (values.has(BINDING_VALUE_STATE)) values.set(BINDING_VALUE_STATE, createInstanceState());
+        elements.set(key, { ...payload, valueExpression: undefined, elementInstances: values });
+    }
+    return { ...instance, valueExpression: undefined, elementInstances: elements };
+}
+
 /** Missing object alternatives must not turn surviving allocations into an exhaustive class set. */
 export function mergeReturnInstances(
     instances: InstanceState[],
@@ -330,7 +350,9 @@ export function mergeReturnInstances(
 ): InstanceState | undefined {
     const merged = mergeInstanceStates(instances);
     // Keep uncertainty on the joined value, not on an original instance retained by another alias.
-    return merged?.classDeclarations?.length && unknown ? { ...merged, classDeclarationsUnknown: true } : merged;
+    if (!merged || !unknown) return merged;
+    const value = unknownBindingAlternative(merged);
+    return value.classDeclarations?.length ? { ...value, classDeclarationsUnknown: true } : value;
 }
 
 function mergeInstanceStatesAtDepth(instances: InstanceState[], depth: number): InstanceState | undefined {
@@ -1417,7 +1439,7 @@ export class TaintTracker {
         for (const symbol of new Set([...a.instanceBindings.keys(), ...b.instanceBindings.keys()])) {
             const left = a.instanceBindings.get(symbol);
             const right = b.instanceBindings.get(symbol);
-            const instance = left && right ? mergeInstances(left, right) : (left ?? right);
+            const instance = left && right ? mergeInstances(left, right) : unknownBindingAlternative((left ?? right)!);
             if (instance)
                 instanceBindings.set(
                     symbol,
@@ -1431,7 +1453,7 @@ export class TaintTracker {
         for (const symbol of new Set([...a.moduleInstances.keys(), ...b.moduleInstances.keys()])) {
             const left = a.moduleInstances.get(symbol);
             const right = b.moduleInstances.get(symbol);
-            const instance = left && right ? mergeInstances(left, right) : (left ?? right);
+            const instance = left && right ? mergeInstances(left, right) : unknownBindingAlternative((left ?? right)!);
             if (instance) moduleInstances.set(symbol, instance);
         }
         let currentThisInstance: InstanceState | undefined;
@@ -1445,7 +1467,7 @@ export class TaintTracker {
         for (const expression of new Set([...a.expressionInstances.keys(), ...b.expressionInstances.keys()])) {
             const left = a.expressionInstances.get(expression);
             const right = b.expressionInstances.get(expression);
-            const instance = left && right ? mergeInstances(left, right) : (left ?? right);
+            const instance = left && right ? mergeInstances(left, right) : unknownBindingAlternative((left ?? right)!);
             if (instance) expressionInstances.set(expression, instance);
         }
         const completionValues = new Map<object, InstanceState>();
@@ -1770,7 +1792,12 @@ export class TaintTracker {
         return array && selected && defined ? { ...selected, valueExpression: defined.valueExpression } : selected;
     }
 
-    private bindingProvenance(values: readonly TaintValue[], incoming: readonly TaintValue[]): TaintValue[] {
+    private bindingProvenance(
+        values: readonly TaintValue[],
+        incoming: readonly TaintValue[],
+        unknown = false,
+    ): TaintValue[] {
+        if (unknown) return [...values, ...incoming];
         if (!values.length || !incoming.length) return values.slice();
         const byFact = new Map<string, TaintValue>();
         for (const taint of incoming) {
@@ -1796,7 +1823,11 @@ export class TaintTracker {
         let selectedInstance = payload?.elementInstances.get("$value");
         if (key != null && !array) {
             const incoming = taints && TaintTracker.taintsForAggregateProperty(taints, key);
-            selectedTaints = payload ? this.bindingProvenance(selectedTaints ?? [], incoming ?? []) : incoming;
+            selectedTaints = payload
+                ? payload.elementInstances.has(BINDING_UNKNOWN_VALUE)
+                    ? [...(selectedTaints ?? []), ...(incoming ?? [])]
+                    : this.bindingProvenance(selectedTaints ?? [], incoming ?? [])
+                : incoming;
             const property = this.checker.getTypeAtLocation(name).getProperty(key);
             selectedInstance ??= property && instance ? this.getInstanceReference(instance, property) : undefined;
             selectedInstance ??= instance?.elementInstances.get(key);
@@ -1804,6 +1835,8 @@ export class TaintTracker {
             selectedInstance ??= this.getElementInstance(instance, key);
             if (this.hasHostType(instance, "Array")) selectedTaints = this.arrayElementTaints(instance, key, taints);
         }
+        if (selectedInstance && payload?.elementInstances.has(BINDING_UNKNOWN_VALUE))
+            selectedInstance = unknownBindingAlternative(selectedInstance);
         return { taints: selectedTaints, instance: selectedInstance, defined: payload?.valueExpression };
     }
 
@@ -2909,13 +2942,20 @@ export class TaintTracker {
         const binding = this.resolveInstance(expr.expression)?.elementInstances.get(
             `${BINDING_PROPERTY}${expr.name.text}`,
         );
+        if (binding?.elementInstances.has(BINDING_UNKNOWN_VALUE)) {
+            const nested = binding.elementInstances.get("$value") ?? this.resolveInstance(expr);
+            if (nested) this.expressionInstanceState.set(expr, unknownBindingAlternative(nested));
+        }
         if (binding)
             return this.bindingProvenance(
                 [...(binding.valueTaints ?? []), ...(this.getInstanceFieldTaint(expr) ?? [])],
                 objectTaints ? TaintTracker.taintsForAggregateProperty(objectTaints, expr.name.text) : [],
+                binding.elementInstances.has(BINDING_UNKNOWN_VALUE),
             );
         const stringField = this.resolveInstance(expr.expression)?.elementInstances.get(expr.name.text);
         if (stringField) return stringField.valueTaints?.slice();
+        const ownFieldTaints = this.getInstanceFieldTaint(expr);
+        if (ownFieldTaints) return ownFieldTaints;
         if (expr.name.text === "length" && this.hasHostType(this.resolveInstance(expr.expression), "Array")) {
             const length = this.resolveInstance(expr.expression)!.elementInstances.get("$sortLength")?.valueTaints;
             return length?.length
@@ -2992,6 +3032,10 @@ export class TaintTracker {
         }
         const key = this.elementKey(expr.argumentExpression);
         const binding = key != null ? container?.elementInstances.get(`${BINDING_PROPERTY}${key}`) : undefined;
+        if (binding?.elementInstances.has(BINDING_UNKNOWN_VALUE)) {
+            const nested = binding.elementInstances.get("$value") ?? this.resolveInstance(expr);
+            if (nested) this.expressionInstanceState.set(expr, unknownBindingAlternative(nested));
+        }
         if (binding)
             return this.bindingProvenance(
                 [
@@ -3001,6 +3045,7 @@ export class TaintTracker {
                         .flatMap(([, taints]) => taints),
                 ],
                 objectTaints ? TaintTracker.taintsForAggregateProperty(objectTaints, key!) : [],
+                binding.elementInstances.has(BINDING_UNKNOWN_VALUE),
             );
         const field = key != null ? container?.elementInstances.get(key) : undefined;
         if (field?.valueTaints) return field.valueTaints.slice();
@@ -4363,18 +4408,9 @@ export class TaintTracker {
             return sourceResult.taints;
         }
 
-        if ((callName === "Object.entries" || callName === "Object.values") && argTaints[0]) {
-            return TaintTracker.clearAggregatePropertyPath(argTaints[0]).map((taint) =>
-                propagate(
-                    taint,
-                    {
-                        kind: "return",
-                        location: this.nodeLocation(expr),
-                        description: `returned from ${callName}()`,
-                    },
-                    this.metrics,
-                ),
-            );
+        const enumeration = this.apiIdentity.builtinName(expr.expression);
+        if (enumeration && ["Object.entries", "Object.values", "Object.keys"].includes(enumeration)) {
+            return this.analyzeObjectEnumeration(expr, enumeration, argTaints[0], argInstances[0]);
         }
         if (
             callName.endsWith("workspace.openNotebookDocument") &&
@@ -4405,6 +4441,7 @@ export class TaintTracker {
         }
 
         const incompleteReturnTaints: TaintValue[] = [];
+        let callEffectsModeled = false;
         // Interprocedural: follow into called function
         if (this.interproc && this.depth < this.maxDepth) {
             // If the call is a method on an instance variable (e.g., `runner.run()`),
@@ -4467,6 +4504,7 @@ export class TaintTracker {
             }
 
             if (callResult) {
+                callEffectsModeled = !callResult.truncated;
                 // Route field state updates back to the instance if the call
                 // was on a known instance variable.
                 if (receiverInstance) {
@@ -4544,22 +4582,25 @@ export class TaintTracker {
         this.recordCompletion("throw", state);
 
         // Only sort eligibility consumes this escape marker; other host models retain their contracts.
-        for (const instance of argInstances) {
-            this.markSortEscape(instance);
-            if (instance) this.invalidateBindingMetadata(instance);
-        }
-        if (ts.isPropertyAccessExpression(expr.expression) || ts.isElementAccessExpression(expr.expression)) {
-            const instance = this.resolveInstance(expr.expression.expression);
-            this.markSortEscape(instance);
-            if (instance) this.invalidateBindingMetadata(instance);
+        if (!callEffectsModeled) {
+            for (const instance of argInstances) {
+                this.markSortEscape(instance);
+                if (instance) this.invalidateBindingMetadata(instance);
+            }
+            if (ts.isPropertyAccessExpression(expr.expression) || ts.isElementAccessExpression(expr.expression)) {
+                const instance = this.resolveInstance(expr.expression.expression);
+                this.markSortEscape(instance);
+                if (instance) this.invalidateBindingMetadata(instance);
+            }
         }
         // Unresolved call passthrough: if we can't see inside the function,
         // propagate taint from arguments and receiver to the return value.
         const passthroughTaints: TaintValue[] = [...incompleteReturnTaints];
 
-        // Tainted arguments
+        // Native serialization consumes the aggregate into a primitive string.
+        const serializesAggregate = this.apiIdentity.builtinName(expr.expression) === "JSON.stringify";
         for (const t of argTaints) {
-            if (t) passthroughTaints.push(...t);
+            if (t) passthroughTaints.push(...(serializesAggregate ? TaintTracker.clearAggregatePropertyPath(t) : t));
         }
 
         // Tainted receiver: for method calls like taintedObj.method() or
@@ -4574,11 +4615,19 @@ export class TaintTracker {
                     !sortIdentity.overridden &&
                     (sortIdentity.memberNames.includes("Array.sort") ||
                         this.standardMethod(expr.expression, ["Array"]));
-                // Sort permutes elements; their field paths do not refer to the method itself.
+                const joinIdentity =
+                    expr.expression.name.text === "join" ? this.modelAPIContext(expr.expression) : undefined;
+                const consumesElementPaths =
+                    joinIdentity != null &&
+                    !joinIdentity.overridden &&
+                    this.standardMethod(expr.expression, ["Array", "ReadonlyArray"]);
+                // Sort permutes elements; join consumes their aggregate values as strings.
                 passthroughTaints.push(
-                    ...(preservesElementPaths
-                        ? receiverTaints
-                        : TaintTracker.taintsForAggregateProperty(receiverTaints, expr.expression.name.text, false)),
+                    ...(consumesElementPaths
+                        ? TaintTracker.clearAggregatePropertyPath(receiverTaints)
+                        : preservesElementPaths
+                          ? receiverTaints
+                          : TaintTracker.taintsForAggregateProperty(receiverTaints, expr.expression.name.text, false)),
                 );
             }
         } else if (ts.isElementAccessExpression(expr.expression)) {
@@ -5871,14 +5920,98 @@ export class TaintTracker {
         return undefined;
     }
 
+    private analyzeObjectEnumeration(
+        expr: ts.CallExpression,
+        method: string,
+        incoming: TaintValue[] | undefined,
+        source: InstanceState | undefined,
+    ): TaintValue[] | undefined {
+        const output = createInstanceState();
+        output.apiTypes = ["Array"];
+        output.elementInstances.set(BINDING_ARRAY_SHAPE, this.hostValue());
+        const result: TaintValue[] = [];
+        let index = 0;
+        const append = (key: string | undefined, keys: readonly TaintValue[], value: InstanceState): void => {
+            const values = value.valueTaints?.slice() ?? [];
+            let selected = value;
+            let taints = values;
+            if (method === "Object.keys") {
+                selected = this.hostValue(keys);
+                taints = keys.slice();
+            } else if (method === "Object.entries") {
+                selected = createInstanceState();
+                selected.apiTypes = ["Array"];
+                selected.elementInstances.set(BINDING_ARRAY_SHAPE, this.hostValue());
+                this.recordBindingProperty(selected, "0", keys, undefined, ts.factory.createStringLiteral(key ?? ""));
+                selected.elementInstances.set("$taint:1", value);
+                const nested = value.elementInstances.get("$value");
+                if (nested) selected.elementInstances.set("1", nested);
+                taints = [...keys, ...values];
+            } else {
+                selected = value.elementInstances.get("$value") ?? value;
+            }
+            const stepped = taints.map((taint) =>
+                propagate(
+                    taint,
+                    { kind: "return", location: this.nodeLocation(expr), description: `returned from ${method}()` },
+                    this.metrics,
+                ),
+            );
+            output.elementInstances.set(`$taint:${index}`, this.hostValue(stepped));
+            output.elementInstances.set(String(index++), selected);
+            result.push(...stepped);
+        };
+        for (const [slot, value] of source?.elementInstances ?? []) {
+            if (!slot.startsWith(BINDING_PROPERTY)) continue;
+            const key = slot.slice(BINDING_PROPERTY.length);
+            const taints = incoming ? TaintTracker.taintsForAggregateProperty(incoming, key) : [];
+            const selected = {
+                ...value,
+                valueTaints: this.bindingProvenance(
+                    value.valueTaints ?? [],
+                    taints,
+                    value.elementInstances.has(BINDING_UNKNOWN_VALUE),
+                ),
+            };
+            append(key, [], selected);
+        }
+        for (const [property, taints] of source?.fields ?? []) {
+            const key = property.getName();
+            if (source?.elementInstances.has(`${BINDING_PROPERTY}${key}`)) continue;
+            append(key, [], this.hostValue(taints, source?.fieldInstances.get(property)));
+        }
+        for (const [property, nested] of source?.fieldInstances ?? []) {
+            const key = property.getName();
+            if (source?.fields.has(property) || source?.elementInstances.has(`${BINDING_PROPERTY}${key}`)) continue;
+            append(key, [], this.hostValue([], nested));
+        }
+        const unknown = source?.elementInstances.get(ENUMERATION_VALUE);
+        if (unknown || !source?.elementInstances.has(BINDING_OBJECT_SHAPE)) {
+            const keys =
+                source?.elementInstances.get(ENUMERATION_KEYS)?.valueTaints ??
+                (incoming ?? []).filter((taint) => !taint.aggregatePropertyPath?.length);
+            const values = incoming?.filter((taint) => taint.aggregatePropertyPath?.[0] !== ENUMERATION_KEYS);
+            const value = unknown?.elementInstances.has(BINDING_UNKNOWN_VALUE)
+                ? this.hostValue([...(unknown.valueTaints ?? []), ...(values ?? [])])
+                : (unknown ?? this.hostValue(values));
+            append(undefined, keys, value);
+        }
+        return this.finishHostCall(expr, output, result).taints;
+    }
+
     private analyzeObjectLiteral(expr: ts.ObjectLiteralExpression, state: TaintState): TaintValue[] | undefined {
         const allTaints: TaintValue[] = [];
         // Properties hold value snapshots and shallow object/function aliases.
         const container = createInstanceState();
         container.elementInstances.set(BINDING_OBJECT_SHAPE, this.hostValue());
+        container.elementInstances.set(ENUMERATION_KEYS, this.hostValue());
         for (const prop of expr.properties) {
             if (ts.isPropertyAssignment(prop)) {
-                if (ts.isComputedPropertyName(prop.name)) this.analyzeExpression(prop.name.expression, state);
+                if (ts.isComputedPropertyName(prop.name)) {
+                    const keys = this.analyzeExpression(prop.name.expression, state);
+                    if (keys) allTaints.push(...TaintTracker.prependAggregateProperty(keys, ENUMERATION_KEYS));
+                    this.storeHostValue(container, ENUMERATION_KEYS, this.hostValue(keys));
+                }
                 const taints = this.analyzeExpression(prop.initializer, state);
                 const name = this.propertyName(prop.name);
                 const stamped = taints && this.stampObjectProperty(taints, name, prop);
@@ -5886,13 +6019,22 @@ export class TaintTracker {
                 const instance = this.resolveValueInstance(prop.initializer, state);
                 const property = this.checker.getSymbolAtLocation(prop.name);
                 if (instance && property) container.fieldInstances.set(property, instance);
-                this.recordBindingProperty(
-                    container,
-                    name,
-                    stamped && name != null ? TaintTracker.taintsForAggregateProperty(stamped, name) : stamped,
-                    instance,
-                    prop.initializer,
-                );
+                if (name == null) {
+                    const keys = container.elementInstances.get(ENUMERATION_KEYS)!;
+                    const values = container.elementInstances.get(ENUMERATION_VALUE);
+                    container.elementInstances = unknownBindingAlternative(container).elementInstances;
+                    container.elementInstances.set(ENUMERATION_KEYS, keys);
+                    if (values) container.elementInstances.set(ENUMERATION_VALUE, values);
+                    this.storeHostValue(container, ENUMERATION_VALUE, this.hostValue(taints, instance));
+                } else {
+                    this.recordBindingProperty(
+                        container,
+                        name,
+                        stamped && TaintTracker.taintsForAggregateProperty(stamped, name),
+                        instance,
+                        prop.initializer,
+                    );
+                }
             } else if (ts.isSpreadAssignment(prop)) {
                 const taints = this.analyzeExpression(prop.expression, state);
                 if (taints)
@@ -5910,6 +6052,13 @@ export class TaintTracker {
                         ),
                     );
                 const source = this.resolveInstance(prop.expression);
+                this.storeHostValue(
+                    container,
+                    ENUMERATION_KEYS,
+                    source?.elementInstances.get(ENUMERATION_KEYS) ?? this.hostValue(taints),
+                );
+                if (source?.elementInstances.has(ENUMERATION_VALUE))
+                    this.storeHostValue(container, ENUMERATION_VALUE, source.elementInstances.get(ENUMERATION_VALUE)!);
                 if (!source?.elementInstances.has(BINDING_OBJECT_SHAPE))
                     container.elementInstances.delete(BINDING_OBJECT_SHAPE);
                 if (source) {
@@ -5968,12 +6117,14 @@ export class TaintTracker {
         seen.add(owner);
         owner.elementInstances.delete(BINDING_OBJECT_SHAPE);
         owner.elementInstances.delete(BINDING_ARRAY_SHAPE);
+        owner.elementInstances.delete(ENUMERATION_KEYS);
+        owner.elementInstances.delete(ENUMERATION_VALUE);
         for (const [key, value] of owner.elementInstances) {
             if (isBindingPayload(key)) {
                 const payload: InstanceState = {
                     ...value,
                     valueExpression: undefined,
-                    elementInstances: new Map(value.elementInstances),
+                    elementInstances: new Map(value.elementInstances).set(BINDING_UNKNOWN_VALUE, createInstanceState()),
                 };
                 if (payload.elementInstances.has(BINDING_VALUE_STATE))
                     payload.elementInstances.set(BINDING_VALUE_STATE, this.hostValue());
@@ -6649,7 +6800,12 @@ export class TaintTracker {
                 : [container.elementInstances.get(`$taint:${key}`), container.elementInstances.get("$taint:*")].filter(
                       (value): value is InstanceState => value != null,
                   );
-        return payloads.length ? payloads.flatMap((value) => value.valueTaints ?? []) : fallback?.slice();
+        return payloads.length
+            ? payloads.flatMap((value) => [
+                  ...(value.valueTaints ?? []),
+                  ...(value.elementInstances.has(BINDING_UNKNOWN_VALUE) ? (fallback ?? []) : []),
+              ])
+            : fallback?.slice();
     }
 
     private getElementInstance(container: InstanceState, key?: string): InstanceState | undefined {
@@ -6664,7 +6820,16 @@ export class TaintTracker {
                           .map(([, value]) => value),
                       container.elementInstances.get(TaintTracker.UNKNOWN_ELEMENT),
                   ].filter((value): value is InstanceState => value != null);
-        return mergeInstanceStates(candidates);
+        const merged = mergeInstanceStates(candidates);
+        const payloads =
+            key == null
+                ? [...container.elementInstances]
+                      .filter(([name]) => name.startsWith("$taint:"))
+                      .map(([, value]) => value)
+                : [container.elementInstances.get(`$taint:${key}`), container.elementInstances.get("$taint:*")];
+        return merged && payloads.some((payload) => payload?.elementInstances.has(BINDING_UNKNOWN_VALUE))
+            ? unknownBindingAlternative(merged)
+            : merged;
     }
 
     private resolveSymbol(node: ts.Node): ts.Symbol | undefined {
