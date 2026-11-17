@@ -363,12 +363,43 @@ export function mergeReturnInstances(
     return value.classDeclarations?.length ? { ...value, classDeclarationsUnknown: true } : value;
 }
 
-function mergeInstanceStatesAtDepth(instances: InstanceState[], depth: number): InstanceState | undefined {
+interface InstanceMergeMemoNode {
+    children: Map<InstanceState, InstanceMergeMemoNode>;
+    result?: InstanceState;
+}
+
+function mergeInstanceStatesAtDepth(
+    instances: InstanceState[],
+    depth: number,
+    memo?: Map<number, InstanceMergeMemoNode>,
+    cacheAllowed: boolean = true,
+): InstanceState | undefined {
     const unique = [...new Set(instances)];
     if (unique.length === 0) return undefined;
     if (unique.length === 1) return unique[0];
 
+    const aligned = cacheAllowed && unique.length === instances.length;
+    let memoNode: InstanceMergeMemoNode | undefined;
+    if (aligned) {
+        memo ??= new Map();
+        memoNode = memo.get(depth);
+        if (!memoNode) {
+            memoNode = { children: new Map() };
+            memo.set(depth, memoNode);
+        }
+        for (const instance of instances) {
+            let next = memoNode.children.get(instance);
+            if (!next) {
+                next = { children: new Map() };
+                memoNode.children.set(instance, next);
+            }
+            memoNode = next;
+        }
+        if (memoNode.result) return memoNode.result;
+    }
+
     const merged = createInstanceState();
+    if (memoNode) memoNode.result = merged;
     merged.apiTypes = [...new Set(unique.flatMap((instance) => instance.apiTypes ?? []))].sort();
     merged.classDeclarations = [...new Set(unique.flatMap((instance) => instance.classDeclarations ?? []))];
     merged.classDeclarationsUnknown =
@@ -394,7 +425,9 @@ function mergeInstanceStatesAtDepth(instances: InstanceState[], depth: number): 
     }
     merged.functions = unionFunctionValues(
         unique.map((instance) => instance.functions),
-        depth < MAX_INSTANCE_MERGE_DEPTH ? (nested) => mergeInstanceStatesAtDepth(nested, depth + 1) : undefined,
+        depth < MAX_INSTANCE_MERGE_DEPTH
+            ? (nested) => mergeInstanceStatesAtDepth(nested, depth + 1, memo, false)
+            : undefined,
     );
 
     if (depth >= MAX_INSTANCE_MERGE_DEPTH) return merged;
@@ -414,7 +447,12 @@ function mergeInstanceStatesAtDepth(instances: InstanceState[], depth: number): 
         }
     }
     for (const [symbol, candidates] of nestedFields) {
-        const nested = mergeInstanceStatesAtDepth(candidates, depth + 1);
+        const nested = mergeInstanceStatesAtDepth(
+            candidates,
+            depth + 1,
+            memo,
+            aligned && candidates.length === unique.length,
+        );
         if (nested) merged.fieldInstances.set(symbol, nested);
     }
     for (const [key, candidates] of nestedElements) {
@@ -422,7 +460,12 @@ function mergeInstanceStatesAtDepth(instances: InstanceState[], depth: number): 
         const values = isBindingPayload(key)
             ? unique.map((owner) => owner.elementInstances.get(key) ?? missingBindingPayload(owner, key))
             : candidates;
-        const nested = mergeInstanceStatesAtDepth(values, depth + 1);
+        const nested = mergeInstanceStatesAtDepth(
+            values,
+            depth + 1,
+            memo,
+            aligned && candidates.length === unique.length,
+        );
         if (nested) merged.elementInstances.set(key, nested);
     }
     return merged;
@@ -909,28 +952,29 @@ export class TaintTracker {
             // Both branches start from the same taint and instance snapshot.
             // Merge only branches that can fall through so state from
             // terminated paths cannot leak past the if statement.
-            const branchEntryState = this.captureLoopAnalysisState(state);
+            const thenEntryState = this.captureLoopAnalysisState(state);
+            const elseEntryState = this.cloneLoopAnalysisState(thenEntryState);
 
-            this.restoreLoopAnalysisState(this.cloneLoopAnalysisState(branchEntryState), state);
+            this.restoreLoopAnalysisState(thenEntryState, state);
             const thenFallsThrough = this.analyzeBranchStatement(
                 stmt.thenStatement,
                 state,
                 returnTaints,
                 returnInstances,
             );
-            const thenExitState = this.captureLoopAnalysisState(state);
+            const thenExitState = this.retainAlternativeState(state);
 
             let elseFallsThrough = true;
-            let elseExitState = this.cloneLoopAnalysisState(branchEntryState);
+            let elseExitState = elseEntryState;
             if (stmt.elseStatement) {
-                this.restoreLoopAnalysisState(this.cloneLoopAnalysisState(branchEntryState), state);
+                this.restoreLoopAnalysisState(elseEntryState, state);
                 elseFallsThrough = this.analyzeBranchStatement(
                     stmt.elseStatement,
                     state,
                     returnTaints,
                     returnInstances,
                 );
-                elseExitState = this.captureLoopAnalysisState(state);
+                elseExitState = this.retainAlternativeState(state);
             }
 
             const branchesToMerge: LoopAnalysisState[] = [];
@@ -1147,6 +1191,7 @@ export class TaintTracker {
                 state,
             );
         }
+        this.completionValues = new Map([...this.completionValues].filter(([key]) => entry.completionValues?.has(key)));
         return finalNormalExits.length > 0;
     }
 
@@ -1267,7 +1312,7 @@ export class TaintTracker {
             const iterationState = this.cloneLoopAnalysisState(loopHeadState);
             this.restoreLoopAnalysisState(iterationState, state);
             analyzeIteration(state);
-            const nextLoopHeadState = this.mergeLoopAnalysisStates(entryState, this.captureLoopAnalysisState(state));
+            const nextLoopHeadState = this.mergeLoopAnalysisStates(entryState, this.retainAlternativeState(state));
             if (this.loopAnalysisStatesEqual(loopHeadState, nextLoopHeadState)) {
                 converged = true;
                 break;
@@ -1282,6 +1327,19 @@ export class TaintTracker {
                 `Loop analysis did not converge after ${MAX_LOOP_ITERATIONS} iterations at ${getLocationString(loop)}`,
             );
         }
+    }
+
+    /** Retain only at an isolated alternative's exit; its graph is transferred to the caller. */
+    private retainAlternativeState(state: TaintState): LoopAnalysisState {
+        return {
+            taints: forkTaintState(state),
+            instanceBindings: new Map(this.instanceFieldState),
+            moduleInstances: new Map(this.interproc?.getModuleInstanceState?.() ?? []),
+            currentThisInstance: this.currentThisInstance,
+            expressionInstances: new Map(this.expressionInstanceState),
+            cleanBindings: new Set(this.cleanBindings),
+            completionValues: new Map(this.completionValues),
+        };
     }
 
     private captureLoopAnalysisState(state: TaintState): LoopAnalysisState {
@@ -1302,25 +1360,27 @@ export class TaintTracker {
             const cached = clones.get(instance);
             if (cached) return cached;
 
-            const clone = createInstanceState();
-            clone.apiTypes = instance.apiTypes;
-            clone.classDeclarations = instance.classDeclarations;
-            clone.classDeclarationsUnknown = instance.classDeclarationsUnknown;
-            clone.hostCallback = instance.hostCallback;
-            clone.valueTaints = instance.valueTaints;
-            clone.valueExpression = instance.valueExpression;
-            clone.taintedElementsFromIndex = instance.taintedElementsFromIndex;
+            const clone: InstanceState = {
+                ...instance,
+                fields: forkTaintState(instance.fields),
+                fieldInstances: new Map(),
+                elementInstances: new Map(),
+                functions: [],
+            };
             clones.set(instance, clone);
             this.instanceOrigins.set(clone, this.instanceOrigins.get(instance) ?? instance);
-            clone.fields = forkTaintState(instance.fields);
-            clone.functions = instance.functions.map((value) => ({
-                ...value,
-                captured: forkTaintState(value.captured),
-                capturedInstances: new Map(
-                    [...value.capturedInstances].map(([symbol, nested]) => [symbol, cloneInstance(nested)]),
-                ),
-                thisInstance: value.thisInstance ? cloneInstance(value.thisInstance) : undefined,
-            }));
+            for (const value of instance.functions) {
+                const capturedInstances = new Map<ts.Symbol, InstanceState>();
+                for (const [symbol, nested] of value.capturedInstances) {
+                    capturedInstances.set(symbol, cloneInstance(nested));
+                }
+                clone.functions.push({
+                    ...value,
+                    captured: forkTaintState(value.captured),
+                    capturedInstances,
+                    thisInstance: value.thisInstance ? cloneInstance(value.thisInstance) : undefined,
+                });
+            }
             for (const [symbol, nested] of instance.fieldInstances) {
                 clone.fieldInstances.set(symbol, cloneInstance(nested));
             }
@@ -2310,7 +2370,7 @@ export class TaintTracker {
                 } else {
                     this.analyzeExpression(fn.body, closureState);
                 }
-                return eventEffects ? this.captureLoopAnalysisState(closureState) : undefined;
+                return eventEffects ? this.retainAlternativeState(closureState) : undefined;
             };
             const analyzed = this.interproc
                 ? this.interproc.trackDepthLimit(analyzeBody)
@@ -2400,7 +2460,7 @@ export class TaintTracker {
         }
         try {
             for (let iteration = 0; iteration < MAX_LOOP_ITERATIONS; iteration++) {
-                const before = this.cloneLoopAnalysisState(eventState);
+                const before = eventState;
                 for (const fn of this.registeredCommandClosures.keys()) {
                     if (
                         !this.freeSymbols(fn).some(
@@ -5896,19 +5956,20 @@ export class TaintTracker {
     private analyzeConditionalExpression(expr: ts.ConditionalExpression, state: TaintState): TaintValue[] | undefined {
         this.analyzeExpression(expr.condition, state);
         const entry = this.captureLoopAnalysisState(state);
-        this.restoreLoopAnalysisState(this.cloneLoopAnalysisState(entry), state);
+        const falseEntry = this.cloneLoopAnalysisState(entry);
+        this.restoreLoopAnalysisState(entry, state);
         const whenTrue = this.analyzeExpression(expr.whenTrue, state);
         const trueInstance = this.resolveInstance(expr.whenTrue);
         if (trueInstance) this.expressionInstanceState.set(expr, trueInstance);
         else this.expressionInstanceState.delete(expr);
-        const trueExit = this.captureLoopAnalysisState(state);
-        this.restoreLoopAnalysisState(this.cloneLoopAnalysisState(entry), state);
+        const trueExit = this.retainAlternativeState(state);
+        this.restoreLoopAnalysisState(falseEntry, state);
         const whenFalse = this.analyzeExpression(expr.whenFalse, state);
         const falseInstance = this.resolveInstance(expr.whenFalse);
         if (falseInstance) this.expressionInstanceState.set(expr, falseInstance);
         else this.expressionInstanceState.delete(expr);
         this.restoreLoopAnalysisState(
-            this.mergeLoopAnalysisStates(trueExit, this.captureLoopAnalysisState(state)),
+            this.mergeLoopAnalysisStates(trueExit, this.retainAlternativeState(state)),
             state,
         );
         const mergedInstance = this.expressionInstanceState.get(expr);
