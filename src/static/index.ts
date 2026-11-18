@@ -16,6 +16,7 @@ import { formatFindingsJSON } from "./reporter";
 import { analyzeDiffScreening } from "./diff";
 import { TaintSpec } from "./spec/types";
 import { builtinSpecs, PresetSelection, presetChoices } from "./spec/presets";
+import { validateSpec } from "./spec/validate";
 import { formatAnalysisDebugLog, formatAnalysisMetrics } from "./metrics";
 import { deduplicateFindings } from "./findingUtils";
 import { deduplicateSappBundle } from "./sappBundle";
@@ -269,8 +270,22 @@ async function runAnalysis(argv: CliArgs): Promise<number> {
     // Load spec
     let spec: TaintSpec | undefined;
     if (argv.spec) {
-        const specContent = fs.readFileSync(resolveExistingCliPath(argv.spec), "utf-8");
-        spec = JSON.parse(specContent);
+        const specPath = resolveExistingCliPath(argv.spec);
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(fs.readFileSync(specPath, "utf-8"));
+        } catch (error) {
+            console.error(
+                `Error: cannot read spec ${specPath}: ${error instanceof Error ? error.message : String(error)}`,
+            );
+            return 1;
+        }
+        const errors = validateSpec(parsed);
+        if (errors.length > 0) {
+            console.error(`Error: invalid spec ${specPath}:\n${errors.map((message) => `  ${message}`).join("\n")}`);
+            return 1;
+        }
+        spec = parsed as TaintSpec;
     } else if (argv.preset !== "auto") {
         spec = builtinSpecs[argv.preset];
     }

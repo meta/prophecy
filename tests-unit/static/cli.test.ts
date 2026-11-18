@@ -176,6 +176,28 @@ describe("CLI smoke tests", () => {
         }
     });
 
+    it("rejects an invalid or unreadable custom spec before analysis", () => {
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), "prophecy-cli-bad-spec-"));
+        const invalid = path.join(directory, "invalid.json");
+        const malformed = path.join(directory, "malformed.json");
+        fs.writeFileSync(invalid, JSON.stringify({ sources: [{ kind: "parameter" }], sinks: [] }));
+        fs.writeFileSync(malformed, "{ sources: [");
+        try {
+            const project = `--project ${path.join(FIXTURES, "uri-handler-rce")}`;
+            const rejected = runCli(`${project} --spec ${invalid} --format json`);
+            expect(rejected.exitCode).toBe(1);
+            expect(rejected.stdout).toBe("");
+            expect(rejected.stderr).toContain(`Error: invalid spec ${invalid}:`);
+            expect(rejected.stderr).toContain("sources[0].pattern: missing required field");
+            expect(rejected.stderr).toContain("sanitizers: missing required field");
+            const unreadable = runCli(`${project} --spec ${malformed} --format json`);
+            expect(unreadable.exitCode).toBe(1);
+            expect(unreadable.stderr).toContain(`Error: cannot read spec ${malformed}:`);
+        } finally {
+            fs.rmSync(directory, { recursive: true, force: true });
+        }
+    });
+
     it("merges completed bundles without analyzing a project", () => {
         const directory = fs.mkdtempSync(path.join(os.tmpdir(), "bundle-cli-"));
         try {
