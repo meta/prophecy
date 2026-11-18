@@ -99,7 +99,7 @@ export const IslSinks: SinkSpec[] = [
     })),
 ];
 
-/** `package.json` names of the ISL VS Code extension and server, which `--preset auto` maps to {@link islSpec}. */
+/** `package.json` names of the ISL VS Code extension and server, which `--rules auto` maps to {@link islSpec}. */
 export const ISL_PACKAGE_NAMES: ReadonlyArray<string> = ["sapling-scm", "isl-server"];
 
 /** The VS Code extension spec plus {@link IslSinks}. */

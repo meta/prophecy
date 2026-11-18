@@ -22,7 +22,7 @@ the revision; it defaults to the checked-out Sapling revision, when there is
 one. File paths are relative to `--repo-root`.
 
 Each repeated `--project` root is analyzed separately and writes its own issue
-and trace files into the same bundle. With `--preset auto`, each root selects
+and trace files into the same bundle. With `--rules auto`, each root selects
 its own preset. Bundle metadata comes from the first root, so pass
 `--sapp-project` to give a multi-root bundle a deliberate name. Findings with
 the same handle are deduplicated across roots.

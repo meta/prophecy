@@ -10,57 +10,56 @@ specifications cover VS Code extensions, Electron main processes, and Express;
 custom JSON specs can describe other APIs that fit the engine's supported
 patterns.
 
-> **Disclaimer.** Prophecy is a developer tool, not a security guarantee. It
-> will likely miss real issues and will likely report flows that turn out to be
-> safe. Treat every finding as a candidate for further review. Neither a finding
-> nor the absence of findings should be read as a statement about the security
+> **Disclaimer.** Prophecy is a security tool, not a guarantee. It
+> can miss real issues and can report flows that turn out to be
+> safe. Treat every finding as a candidate for further review. Neither a finding,
+> nor the absence of findings, should be read as a statement about the security
 > of the analyzed code.
 
 ---
 
 ## What is taint analysis?
 
-Taint analysis tracks untrusted data through a program to find injection
-vulnerabilities. Prophecy's rules come in three kinds:
+Imagine a maze of pipes with several exits. Add a drop of red dye to the
+water at one entrance. If an exit runs red, you know there's a path from
+that entrance to that exit.
+
+Prophecy uses the same idea. It marks untrusted input as **tainted**, like
+adding dye to the water. Then it traces the code to see which operations
+that input could reach.
+
+To decide which traces to flag, Prophecy looks for three things:
 
 - **Sources** are where untrusted data enters, such as the `uri` passed to a
   VS Code URI handler or `req.query` in an Express route. Their values are
   tainted.
-- **Sinks** are operations that are dangerous when they receive tainted data,
+- **Sinks** are functions that are dangerous when they receive tainted data,
   such as `child_process.exec`, `Terminal.sendText`, or `res.redirect`.
 - **Sanitizers** are transformations that make a value safe for some sinks,
-  such as `parseInt` before the value is placed in a shell command. Each
-  sanitizer covers only the sink categories or sink names it declares.
+  such as `shlex.quote` before the value is placed in a shell command.
 
 Taint propagates through assignments, function calls, string operations, and
 other constructs. Prophecy reports a finding when tainted data reaches a sink
 without passing through a sanitizer that covers that sink. It does this
 statically, without running the analyzed code.
 
-## How does Prophecy work?
+## How does Prophecy actually work?
 
 Prophecy reads the TypeScript syntax tree and type information. It does not run
-the program.
+the program. Findings are rule-based. Prophecy does not use an LLM to detect flows, assign
+severity, or write finding text: descriptions and severities come from the
+matched sink rule.
 
 1. **Load the project and rules.** Build a TypeScript program from the
    project's `tsconfig.json`, then load sources, sinks, and sanitizers from a
    built-in preset or a custom spec.
 2. **Find entry points.** Locate entry functions and registered callbacks, such
    as VS Code URI handlers and Express routes.
-3. **Follow the data.** Propagate taint through assignments, properties,
-   strings, branches, loops, and function calls, including calls across files.
+3. **Follow the data.** Propagate taint through assignments, properties, branches, loops, and function calls, including calls across files.
 4. **Report.** When tainted data reaches a sink without a covering sanitizer,
    report the source, the sink, and each step in between, as text, JSON,
-   Mermaid, lint output, or data for [SAPP](https://github.com/facebook/sapp),
-   Meta's open source static analysis post-processor.
-
-For example, `uri.query` passed through a helper into `child_process.exec`
-produces a trace from the URI-handler parameter, through the property read and
-helper call, to the shell-execution sink.
-
-Findings are rule-based. Prophecy does not use an LLM to detect flows, assign
-severity, or write finding text: descriptions and severities come from the
-matched sink rule.
+   Mermaid, lint output, or data for **[facebook/SAPP](https://github.com/facebook/sapp)**,
+   Meta's open source Static Analysis Post-Processor.
 
 See [limitations](#limitations) for what the analysis can miss, and
 [architecture](docs/architecture.md) for how each step is implemented.
@@ -70,8 +69,7 @@ See [limitations](#limitations) for what the analysis can miss, and
 Prophecy needs Node.js 22.12 or later and pnpm 10.26.0 (pinned in
 `package.json`).
 
-```bash
-npm install --global pnpm@10.26.0
+```shell
 pnpm install --frozen-lockfile
 pnpm build
 ```
@@ -79,7 +77,7 @@ pnpm build
 Install the dependencies of the project you want to analyze, including its type
 declarations, then run:
 
-```bash
+```shell
 node dist/index.js --project <path-to-project> --require-types
 ```
 
@@ -90,17 +88,14 @@ less accurate. `--require-types` fails on unresolved Node built-in imports and
 on type libraries named in `tsconfig` that are not installed; it is not a full
 type check.
 
-An invalid or unreadable `tsconfig`, an unresolved `extends`, or a missing file
-listed in the config is an error. A config that selects no files only prints a
-warning, so if a scan finds nothing, check stderr first.
+To see how Prophecy traces `uri.query` from a VS Code URI handler to
+`child_process.exec`, try this bundled fixture:
 
-To try a bundled fixture, which passes `uri.query` to `child_process.exec`:
-
-```text
+```shell
 $ node dist/index.js --project tests-unit/static/fixtures/uri-handler-rce
 
 Analyzing /path/to/prophecy/tests-unit/static/fixtures/uri-handler-rce...
-Using preset: auto
+Using rules: auto
 
   → EP 1/2: Entry function: activate() @ /path/to/prophecy/tests-unit/static/fixtures/uri-handler-rce/extension.ts:12:1
   → EP 2/2: URI handler (vscode:// deeplink) @ /path/to/prophecy/tests-unit/static/fixtures/uri-handler-rce/extension.ts:15:13
@@ -133,146 +128,23 @@ Findings are candidates for further review, not confirmed security issues.
 Entry-point lines (`→ EP`) go to stderr; the report goes to stdout. For the
 parts of the report, see [reading reports](docs/reading-reports.md).
 
-## Presets
+See the [CLI reference](docs/cli-reference.md) for flags and environment
+variables, or [scan workflows](docs/scan-workflows.md) for patch screening
+and CI.
 
-A preset is a built-in spec: the sources, sinks, and sanitizers for one kind of
-project.
+## Detection rules
 
-| Preset             | Models                         | `--preset auto` selects it when `package.json` has |
-| ------------------ | ------------------------------ | -------------------------------------------------- |
-| `isl`              | Sapling's Interactive Smartlog | the package name `sapling-scm` or `isl-server`     |
-| `vscode-extension` | VS Code extensions             | `engines.vscode` or a `@types/vscode` dependency   |
-| `electron`         | Electron main processes        | an `electron` dependency                           |
-| `express`          | Express servers                | an `express` or `@types/express` dependency        |
+Prophecy has built-in rules for VS Code extensions (`vscode-extension`),
+Sapling's Interactive Smartlog (`isl`), Electron main processes (`electron`),
+and Express servers (`express`).
 
-`auto` is the default. It reads the root `package.json`, including dev
-dependencies, and checks the rows above in order. If nothing matches, or the
-file is missing, it uses `vscode-extension`. Each project root gets one preset;
-for a package that mixes frameworks, pass `--preset` or a custom spec.
+By default, Prophecy picks a rule set from the project's `package.json`. If
+nothing matches, it uses `vscode-extension`. To choose one yourself, pass
+`--rules`, for example `--rules express`.
 
-**Shared Node sinks**, in every preset: child-process and Execa/cross-spawn
-execution, dynamic code execution, fetch, Node HTTP and Axios requests, and
-file reads, writes, appends, and streams. Separate rules cover the executable,
-arguments, options, path, and content of a call, so one call can match more
-than one rule. A file path sink does not make the file's contents a source.
-
-**VS Code.** Sources are URI handlers, webview messages, debug configuration
-callbacks, workspace settings, document content, file reads and names, selected
-command output, clipboard reads, input dialogs, HTTP requests, and message
-events. Sinks add terminals, commands, language-client launch options, debug
-configuration fields that run commands, webview HTML, external URLs, and
-workspace edits. Settings declared with `machine` or `application` scope stay
-sources and are labeled with their scope. `process.env` is not a source,
-because the extension host inherits it from the user's session.
-
-**ISL.** The VS Code preset, plus sinks for ISL's command wrappers (`ejeca`,
-`runCommand`, `Repository.runCommand`, `runOrQueueOperation`), the executable a
-`RepositoryCache` context names, and file reads and deletes.
-
-**Express.** Sources are request data in route and `use` handlers, including
-`head`, `options`, and `app.route(path)` chains. State that middleware passes
-through `next()`, including `res.locals`, is tracked for supported
-registrations. Sinks add response bodies, redirects, template names, and served
-file paths. `res.render` checks the view name, not the locals.
-
-**Electron.** Sources are `ipcMain` handler payloads and the `open-url` URL.
-Sinks add `shell.openExternal`. Event metadata from the host is not a source.
-
-**Sanitizers.** Every preset includes `parseInt` and `Number` for
-string-injection sinks; the resulting number stays tainted for other sinks.
-The VS Code preset also models `shlex.quote`. A quoted argument to a fixed
-command is reported as argument injection instead of command execution. A
-quoted argument to a shell or interpreter on its denylist is still command
-execution.
-
-[Framework and API coverage](docs/framework-models.md) describes each model in
-detail.
-
-## Custom specs
-
-`--spec <file.json>` replaces the preset; it does not extend one. The fields
-are defined in [`src/static/spec/types.ts`](src/static/spec/types.ts).
-Prophecy checks the file against those types before analysis and exits 1 on an
-unknown field, a missing required field, or an invalid value.
-
-This spec models a webhook library whose `onPush` callback receives an
-untrusted event:
-
-```json
-{
-  "sources": [
-    {
-      "kind": "parameter",
-      "pattern": "onPush.event",
-      "callbackRegistration": "onPush",
-      "taintAllProperties": true,
-      "description": "Push event payload from the webhook"
-    }
-  ],
-  "sinks": [
-    {
-      "kind": "callArgument",
-      "name": "exec",
-      "pattern": "child_process.exec",
-      "categories": ["rce"],
-      "severity": "critical",
-      "description": "Command execution via child_process.exec"
-    }
-  ],
-  "sanitizers": [
-    {
-      "kind": "callReturnValue",
-      "pattern": "parseInt",
-      "categories": ["rce"],
-      "description": "Integer parsing"
-    }
-  ]
-}
-```
-
-Against this handler, the spec reports the first `exec`. The second is
-sanitized by `parseInt`:
-
-```ts
-export function main() {
-  onPush((event) => {
-    exec(`git checkout ${event.branch}`);
-    exec(`sleep ${parseInt(event.retries, 10)}`);
-  });
-}
-```
-
-```bash
-node dist/index.js --project tests-unit/static/fixtures/custom-spec \
-  --spec tests-unit/static/fixtures/custom-spec/spec.json
-```
-
-- `taintAllProperties` keeps taint on property reads such as `event.branch`.
-  Without it, this example reports nothing.
-- `callbackRegistration` matches the end of the call name, so `onPush` also
-  matches `bot.onPush`.
-
-A spec has these top-level fields:
-
-- `sources`: tainted return values, property reads, and callback parameters.
-- `sinks`: call arguments and property assignments to check.
-- `sanitizers`: transformations, each scoped to sink `categories` or
-  `sinkNames`.
-- `entryFunctions`: named functions to analyze with clean parameters, such as
-  `activate` or `main`.
-- `handlerEntryPoints`: methods the host calls on a registered object, such as
-  VS Code's `provideCodeLenses`, analyzed with clean parameters.
-- `fixStrategies`: suggested repairs per sink, overriding the defaults.
-
-To build on a preset, export it as JSON and edit the copy:
-
-```bash
-node -e 'console.log(JSON.stringify(require("./dist/spec/presets").builtinSpecs.express, null, 2))' > spec.json
-```
-
-APIs whose callback shapes, dispatch, or use-site semantics the engine does not
-support need engine changes. See
-[adding a pattern](docs/development.md#adding-a-pattern).
+See [Framework and API coverage](docs/framework-models.md) for how Prophecy
+picks a preset and what each one checks. To write your own rules, see
+[Custom specs](docs/custom-specs.md).
 
 ## Output formats
 
@@ -284,126 +156,37 @@ support need engine changes. See
 | `lint`      | One JSON lint message per line, with suggested repairs                                               |
 | `sapp-json` | A [SAPP](https://github.com/facebook/sapp) bundle in `--output-dir`; see [SAPP output](docs/sapp.md) |
 
-Lint and SAPP output suggest repairs, such as `exec()` → `execFile()` or
-`ShellExecution` → `ProcessExecution`. Review each one: replacing `exec` with
-`execFile` means separating a trusted program from its arguments, and quoting a
-whole terminal command is not a fix. The lint formatter marks every replacement
-as unsafe to apply automatically.
-
-## Screening a patch
-
-```bash
-node dist/index.js --patch-file /tmp/change.patch --repo-root <path-to-repo>
-```
-
-The patch selects files; it is **not applied**. Check out the revision you want
-to scan first. Prophecy analyzes the projects that contain changed TypeScript
-files and keeps findings whose source, sink, or propagation steps touch a
-changed file. It does not limit analysis to changed lines or compare against
-the parent revision, so findings can predate the patch.
-
-Changed paths must exist inside `--repo-root`. Each changed file is assigned to
-the project of its nearest `tsconfig.json` within that root, then its nearest
-`package.json`, then its own directory.
-
-## Using Prophecy in CI
-
-Prophecy exits 0 whenever the scan finishes, with or without findings. To fail
-a build on findings, check the JSON output:
-
-```bash
-node dist/index.js --project . --require-types --format json > prophecy.json
-jq -e 'length == 0' prophecy.json
-```
-
-| Exit code | Meaning                                                                                        |
-| --------- | ---------------------------------------------------------------------------------------------- |
-| 0         | The scan finished, with or without findings. Some entry points may be incomplete.              |
-| 1         | Invalid input: flags, spec, project configuration, syntax errors, or a SAPP bundle merge       |
-| 2         | Unexpected exception, unsupported reference-only solution config, or `--require-types` failure |
-
-The per-entry-point time budget depends on machine speed and load, so two runs
-on the same code can differ. `PROPHECY_EP_BUDGET_MS=0` removes the time budget;
-depth and state limits still apply. `PROPHECY_STRICT=1` fails the scan on
-unexpected analyzer errors instead of skipping the entry point.
+Lint and SAPP output suggest repairs, such as `exec()` → `execFile()` in Node.js
+or `vscode.ShellExecution` → `vscode.ProcessExecution` in VS Code tasks. Review
+each one -- they are not always safe to automatically apply.
 
 ## Limitations
 
-- **Validation is not sanitization.** Guards such as
-  `if (allowlist.includes(x))` or a regex test do not clear taint, so a
-  validated value that reaches a sink is still reported. The
-  `clean-uri-handler` fixture records this false positive.
-- **Coverage is bounded.** Each entry point has a 90-second budget by default,
-  plus call-depth (`--max-depth`, default 5), state, and iteration limits.
-  Entry points cut short are listed on stderr, but some truncation is silent,
-  and the scan still exits 0.
-- **One trace per sink line.** Findings are deduplicated by source, sink, entry
-  point, and sink line, so other paths to the same sink can be omitted.
 - **Imports must resolve.** Taint crosses files only through imports and calls
   the TypeScript program resolves. Project references are not followed; pass
   each referenced project as its own `--project`.
-- **Dynamic dispatch.** A call on an interface or base class expands to at most
-  eight implementations in the program. Dynamic method names and structural
-  implementations are not resolved.
+- **Coverage is bounded.** Each entry point has a 90-second budget by default,
+  plus call-depth (`--max-depth`, default 5), state, and iteration limits.
+  Entry points cut short are listed on stderr, and the scan still exits 0.
 - **Control flow.** Branches keep separate state and loops iterate to a bounded
   fixed point. `switch`, loop exits, and `try`/`catch`/`finally` are
   approximated; the analysis is not path-sensitive.
+- **Prophecy can't follow every call.** If Prophecy can't tell what code a
+  call will run, it may treat the result as tainted based on the input. It can
+  still miss flows inside the call.
 - **Callbacks.** `.map()` and `.filter()` are modeled. Callbacks passed to
   unknown higher-order functions, microtask ordering, and some aliasing are
   not.
-- **Unresolved calls pass taint through.** A call Prophecy cannot resolve
-  passes taint from its arguments and receiver to its result, so
-  `uri.query.trim()` stays tainted. This reports more false positives in
-  exchange for fewer missed flows.
-- **Sanitizer context.** Only shell quoting is checked against how its result
-  is used. `JSON.stringify` and `encodeURIComponent` are not sanitizers,
-  because their safety depends on how the result is decoded or used.
-- **File writes.** A file-content finding does not distinguish an inert cache
-  from a file that is later executed, such as a task configuration or a shell
-  startup file.
+- **Reports can omit alternate paths.** When several paths produce the same
+  finding, Prophecy shows one trace for it.
+- **Sanitizers have limits.** Prophecy gives sanitizers credit only in the
+  cases it models. A flow can still be flagged after an allowlist or regex
+  check.
+- **File writes.** Prophecy can flag code that writes untrusted data into a
+  file. The finding doesn't tell you whether anything later uses that data
+  as instructions.
 
-[Architecture](docs/architecture.md#analysis-limits) has the details.
-
-## CLI reference
-
-Analyze with exactly one of `--project` or `--patch-file`.
-`--merge-sapp-bundle` is a separate mode for a finished SAPP bundle.
-
-| Flag                   | Meaning                                                                        | Default                          |
-| ---------------------- | ------------------------------------------------------------------------------ | -------------------------------- |
-| `--project, -p`        | Project root to analyze; repeat for several roots                              | —                                |
-| `--patch-file`         | Unified patch whose changed files select what to analyze                       | —                                |
-| `--merge-sapp-bundle`  | Remove duplicate issue rows from a finished SAPP bundle, in place              | —                                |
-| `--preset`             | `auto`, `vscode-extension`, `express`, `electron`, or `isl`                    | `auto`                           |
-| `--spec, -s`           | Custom spec JSON; replaces the preset                                          | —                                |
-| `--format, -f`         | `text`, `json`, `mermaid`, `lint`, or `sapp-json`                              | `text`                           |
-| `--output-dir, -o`     | Output directory; required for `sapp-json`                                     | —                                |
-| `--sapp-project`       | Project name in SAPP metadata                                                  | First root's package or dir name |
-| `--sapp-commit`        | Revision in SAPP metadata                                                      | Sapling revision, if available   |
-| `--repo-root`          | Root for relative SAPP paths and patch screening                               | See below                        |
-| `--require-types`      | Fail on missing type declarations                                              | `false`                          |
-| `--max-depth`          | Maximum interprocedural call depth                                             | `5`                              |
-| `--exclude`            | Skip source files whose path contains this substring; repeatable               | —                                |
-| `--shard-index`        | Zero-based index of this process's shard                                       | `0`                              |
-| `--shard-count`        | Number of shards                                                               | `1`                              |
-| `--progress-log`       | File to append progress lines to in `json`, `lint`, and `sapp-json` modes      | —                                |
-| `--entry-point-filter` | Debugging: analyze only entry points whose `file:line` contains this substring | —                                |
-| `--analysis-stats`     | Debugging: print how many matches were type-resolved versus heuristic          | `false`                          |
-| `--analysis-debug`     | Debugging: print JSON about matching decisions                                 | `false`                          |
-
-Without `--repo-root`, project mode uses the nearest parent directory that has
-an `.arcconfig`, and patch mode runs `sl root`; outside Sapling, pass
-`--repo-root`. `--exclude`, sharding, and `--entry-point-filter` apply only to
-project mode. Exit codes are listed under
-[Using Prophecy in CI](#using-prophecy-in-ci).
-
-| Environment variable     | Effect                                                               | Default |
-| ------------------------ | -------------------------------------------------------------------- | ------- |
-| `PROPHECY_EP_BUDGET_MS`  | Time budget per entry point, in milliseconds; `0` disables it        | `90000` |
-| `PROPHECY_STRICT`        | `1` fails the scan on unexpected analyzer errors                     | unset   |
-| `PROPHECY_STACK_SIZE_MB` | Stack size of the analysis worker thread                             | `64`    |
-| `PROPHECY_CACHE_ENTRIES` | Maximum cached call results per entry point                          | `1500`  |
-| `PROPHECY_NO_WORKER`     | `1` runs analysis on the main thread, with Node's default stack size | unset   |
+[Architecture](docs/architecture.md#analysis-limits) has more details.
 
 ## Finding categories
 

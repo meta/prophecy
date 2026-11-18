@@ -107,14 +107,19 @@ coverage limits still produce an incomplete report.
 solution config with only references is rejected rather than reported as an
 empty scan; pass each referenced project as its own `--project`.
 
-**Dynamic dispatch.** A known concrete receiver class selects the method body
-in the program, including base-class overrides and function-valued class
-properties. A call on an abstract class, interface, or open base class expands
-to at most eight implementations in the program. Beyond that, the known targets
-are joined with an unresolved alternative, so their heap writes are not
-treated as certain. Declaration files have no bodies to analyze, and dynamic
-method names, structural implementations, and unknown receivers do not form a
-closed set of targets.
+**Method calls.** If Prophecy knows the object's concrete class, it can follow
+that class's method, including overrides and function-valued properties. If it
+only knows an interface or base class, it can look for possible implementations
+in the program. If the search finds more than eight, Prophecy discards that list.
+It can still analyze method bodies it knows about from the concrete class or
+base class, but it doesn't assume that any of them will run. Type declarations
+alone don't supply a method body, and Prophecy cannot enumerate every target of
+a computed method name or an interface implemented only by shape.
+
+When Prophecy cannot resolve a call, it may carry taint from the arguments or
+the object receiving the call into the result. That can flag results that do
+not depend on the input. It does not model what the unknown code does with the
+input, such as writing a field or invoking a callback.
 
 **Instances and callbacks.** Supported `.map()` calls use the callback's
 results; `.filter()` keeps the original elements. Function values can carry
@@ -128,10 +133,13 @@ without taint after such a call may still be tainted at runtime.
 fixed point. Loop exits, `switch` cases, and `try`/`catch`/`finally` are
 handled conservatively. The analysis is not path-sensitive.
 
-**Validation and sanitizers.** Control-flow guards such as
-`if (allowlist.includes(x))` and regex tests are not sanitizers. Only shell
-quoting is checked against how its result is used; `JSON.stringify` and
-`encodeURIComponent` are not general sanitizers.
+**Validation and sanitizers.** Guards such as `if (allowlist.includes(x))` and
+regex tests do not clear taint. A sanitizer only applies to the sink categories
+or sink names its rule covers. When analyzing shell text, Prophecy checks where
+a quoted value is used. A recognized numeric conversion can preserve the
+context for later quoted arguments if its result stays a number and is used as
+an argument to a known command.
+`JSON.stringify` and `encodeURIComponent` are not general sanitizers.
 
 **File writes.** File-content findings do not distinguish an inert cache from
 a file that is later executed, such as a task configuration or a shell startup
@@ -140,7 +148,9 @@ file.
 ## Finding identity
 
 A finding's `handle` combines the source pattern, sink name, entry point, sink
-file, and sink line. Deduplication keeps the first finding for each handle, so
-other paths to the same sink can be omitted, and moving the sink to another
-line changes the handle. SAPP issues use a separate handle that survives line
-changes; see [issue identity](sapp.md#issue-identity).
+file, and sink line. Several findings can share a line if their handles differ.
+Prophecy keeps the first trace for each handle, except that a command execution
+finding can replace an earlier argument injection finding with the same handle.
+This can omit alternate paths. Moving the sink to another line changes the
+handle. SAPP issues use a separate handle that survives line changes; see
+[issue identity](sapp.md#issue-identity).

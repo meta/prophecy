@@ -50,7 +50,7 @@ interface CliArgs {
     diff?: string;
     "diff-version"?: string;
     "patch-file"?: string;
-    preset: PresetSelection;
+    rules: PresetSelection;
     spec?: string;
     format: OutputFormat;
     "output-dir"?: string;
@@ -113,7 +113,7 @@ function parseArgv(): CliArgs {
         .option("project", {
             alias: "p",
             describe:
-                "Project root to analyze. Repeat for multiple roots; auto selects a spec per root, while --preset or --spec applies to all roots. SAPP output uses one issue/trace pair per root.",
+                "Project root to analyze. Repeat for multiple roots. Auto-detection picks rules per root; explicitly selecting a rule set with --rules or --spec applies it to all roots. SAPP output uses one issue/trace pair per root.",
             type: "array",
             string: true,
         })
@@ -130,9 +130,9 @@ function parseArgv(): CliArgs {
             describe: "Path to a unified diff/patch file to screen",
             type: "string",
         })
-        .option("preset", {
-            describe:
-                "Built-in taint specification preset. 'auto' picks one from the project's package.json (see detectSpec).",
+        .option("rules", {
+            alias: "preset",
+            describe: "Built-in detection rules. 'auto' picks a set based on the project's package.json.",
             choices: presetChoices,
             default: "auto" as const,
         })
@@ -286,10 +286,10 @@ async function runAnalysis(argv: CliArgs): Promise<number> {
             return 1;
         }
         spec = parsed as TaintSpec;
-    } else if (argv.preset !== "auto") {
-        spec = builtinSpecs[argv.preset];
+    } else if (argv.rules !== "auto") {
+        spec = builtinSpecs[argv.rules];
     }
-    // preset "auto" leaves spec undefined so analyze() calls detectSpec().
+    // Leaving spec undefined lets analyze() choose rules for each project.
 
     const projectDirs: string[] = [];
     for (const rawProject of projectArgs) {
@@ -317,7 +317,7 @@ async function runAnalysis(argv: CliArgs): Promise<number> {
 
     if (argv.format === "text" || argv.format === "mermaid") {
         console.log(`Analyzing ${projectDirs.length > 0 ? projectDirs.join(", ") : (argv.diff ?? patchFile)}...`);
-        console.log(argv.spec ? `Using spec: ${argv.spec}` : `Using preset: ${argv.preset}`);
+        console.log(argv.spec ? `Using spec: ${argv.spec}` : `Using rules: ${argv.rules}`);
         console.log("");
     }
 

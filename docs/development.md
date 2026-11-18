@@ -107,7 +107,7 @@ fixture names. The tables below describe a selection; every fixture is in
 | `websocket-server-rce`           | WebSocket message → `executeCommand`                                                                      |
 | `void-expression-sink`           | A `void expr` operand still reaches the sink                                                              |
 | `express-rce`                    | Express routes → web and shared Node.js sinks                                                             |
-| `custom-spec`                    | The README's custom spec example: a webhook callback → `exec`, with `parseInt` as a sanitizer             |
+| `custom-spec`                    | Webhook callback → `exec`, with a `parseInt` sanitizer ([example](custom-specs.md#example))               |
 
 **Discovery, sanitizers, and robustness:**
 

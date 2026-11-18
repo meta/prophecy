@@ -6,6 +6,24 @@ declarations where they exist: framework and wrapper rules match on API
 identity, established through imports, supported factories, host callback
 types, or declarations. A local method with the same name does not match.
 
+## Choosing a preset
+
+`--rules auto` is the default. Prophecy checks each project root's
+`package.json` in the order below. It checks both regular and development
+dependencies.
+
+| Preset             | Selects when `package.json` has                  |
+| ------------------ | ------------------------------------------------ |
+| `isl`              | The package name `sapling-scm` or `isl-server`   |
+| `vscode-extension` | `engines.vscode` or a `@types/vscode` dependency |
+| `electron`         | An `electron` dependency                         |
+| `express`          | An `express` or `@types/express` dependency      |
+
+If nothing matches or Prophecy can't load `package.json`, it uses
+`vscode-extension`. Each project root gets one preset. If a project mixes
+frameworks, choose a preset with `--rules` or provide a
+[custom spec](custom-specs.md).
+
 ## Presets
 
 | Preset             | Sources                                                                                                                                                                                                                       | Sinks and exclusions                                                                                                                                                                                  |
@@ -15,10 +33,15 @@ types, or declarations. A local method with the same name does not match.
 | `electron`         | `ipcMain.handle/handleOnce/on/once/addListener` payload parameters after the event; the `app` `open-url` URL argument                                                                                                         | Shared Node sinks and `shell.openExternal`. Host event metadata and unrelated application events are not sources                                                                                      |
 | `express`          | Request fields and header accessors in route callbacks and `use`, `head`, `options`, and `app.route(path)` handlers                                                                                                           | Shared Node sinks; response bodies, redirects, selected template names, and served file paths. The request's `app` and response metadata are not tainted as a whole                                   |
 
+The VS Code preset treats settings declared with `machine` or `application`
+scope as sources and labels them with their scope. It excludes `process.env`
+because the extension host inherits it from the user's session. The ISL preset
+adds rules for `ejeca`, `runCommand`, `Repository.runCommand`, and
+`runOrQueueOperation`.
+
 The Express preset also models Node `http` and `https` server requests. It
 does not model authentication, middleware ordering beyond what is described
-below, or a framework's full lifecycle. For how `--preset auto` chooses a
-preset, see [presets](../README.md#presets).
+below, or a framework's full lifecycle.
 
 ## Express middleware
 
@@ -62,6 +85,11 @@ Everything else stays a candidate:
 - opaque application factories and imported application state.
 
 ## Shared Node APIs
+
+Every preset checks child-process and dynamic code execution, outgoing HTTP
+requests, and file access. Separate rules can match different parts of the same
+call, such as an executable and its arguments or a file's path and content.
+A file path sink does not make the file's contents a source.
 
 - **Fetch.** Matches the standard global or its declarations, and the
   `node-fetch` default and `undici.fetch` exports. Native globals and their
@@ -115,6 +143,14 @@ typed parameters, receivers that escape, replaced getters or prototypes, and
 local lookalike classes do not qualify, and opaque fields and return values
 stay conservative. A size that selects a file, executable, or argument is
 still reported: a number is not a general sanitizer for resource selection.
+
+## Sanitizers
+
+Every preset includes `parseInt` and `Number` for string-injection sinks; the
+resulting number stays tainted for other sinks. The VS Code preset also models
+`shlex.quote`. A quoted argument to a fixed command is reported as argument
+injection instead of command execution. A quoted argument to a shell or
+interpreter on its denylist is still command execution.
 
 Custom HTML or XML escaping, JSON script-data encoders, and local shell-quoting
 helpers generally stay candidates. A helper's name says nothing about its

@@ -60,7 +60,7 @@ function localPackage(name, version) {
 function scan(project) {
     return run(
         process.execPath,
-        [CLI, "--project", project, "--preset", "auto", "--require-types", "--format", "json"],
+        [CLI, "--project", project, "--rules", "auto", "--require-types", "--format", "json"],
         project,
     );
 }

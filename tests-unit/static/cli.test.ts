@@ -162,15 +162,32 @@ describe("CLI smoke tests", () => {
         }
     });
 
-    it("names the custom spec instead of the unused preset", () => {
+    it.each(["--rules", "--preset"])("overrides automatic rule selection with %s", (flag) => {
+        const project = `--project ${path.join(FIXTURES, "uri-handler-rce")}`;
+        const result = runCli(`${project} ${flag} express --format json`);
+        expect(result.exitCode).toBe(0);
+        expect(JSON.parse(result.stdout)).toEqual([]);
+    });
+
+    it("reports only the unsanitized flow in the bundled custom spec example", () => {
+        const project = path.join(FIXTURES, "custom-spec");
+        const { stdout, exitCode } = runCli(
+            `--project ${project} --spec ${path.join(project, "spec.json")} --format json --require-types`,
+        );
+        expect(exitCode).toBe(0);
+        expect(JSON.parse(stdout)).toMatchObject([{ sinkLocation: { text: "exec(`git checkout ${event.branch}`)" } }]);
+    });
+
+    it("uses the custom spec instead of the selected built-in rules", () => {
         const directory = fs.mkdtempSync(path.join(os.tmpdir(), "prophecy-cli-spec-"));
         const spec = path.join(directory, "spec.json");
         fs.writeFileSync(spec, JSON.stringify({ sources: [], sinks: [], sanitizers: [] }));
         try {
-            const { stdout, exitCode } = runCli(`--project ${path.join(FIXTURES, "uri-handler-rce")} --spec ${spec}`);
+            const project = `--project ${path.join(FIXTURES, "uri-handler-rce")}`;
+            const { stdout, exitCode } = runCli(`${project} --rules vscode-extension --spec ${spec}`);
             expect(exitCode).toBe(0);
             expect(stdout).toContain(`Using spec: ${spec}`);
-            expect(stdout).not.toContain("Using preset");
+            expect(stdout).not.toContain("Using rules");
         } finally {
             fs.rmSync(directory, { recursive: true, force: true });
         }
@@ -277,7 +294,7 @@ describe("CLI smoke tests", () => {
              }`,
         );
 
-        const { stdout, stderr, exitCode } = runCli(`--project ${projectDir} --preset vscode-extension --format json`);
+        const { stdout, stderr, exitCode } = runCli(`--project ${projectDir} --rules vscode-extension --format json`);
 
         expect(exitCode).toBe(0);
         expect(stderr).not.toContain("failed to parse tsconfig.json");

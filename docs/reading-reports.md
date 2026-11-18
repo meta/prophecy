@@ -55,10 +55,11 @@ positions, and categories. Traces with different recorded roots are never
 merged. Every trace is still printed inside its group, and Mermaid draws one
 chart per group with one subgraph per trace.
 
-Grouping only affects presentation. JSON keeps every finding and adds
-`reporting: {kind, limitation}`. SAPP keeps one issue per finding, with
-`prophecy-reporting-kind` and `prophecy-reporting-limitation` features. No
-group key is used for deduplication.
+Grouping only affects presentation. Alternate paths can still be omitted when
+Prophecy [deduplicates findings by handle](architecture.md#finding-identity).
+JSON includes each remaining finding and adds `reporting: {kind, limitation}`.
+SAPP keeps one issue per finding, with `prophecy-reporting-kind` and
+`prophecy-reporting-limitation` features.
 
 ## Multiple project roots
 
