@@ -6,26 +6,61 @@
  */
 
 import * as path from "path";
-import { TaintFinding, CodeLocation } from "./spec/types";
-import { findingReporting, findingKindLabels, groupFindingsForPresentation, FindingGroup } from "./findingUtils";
+import { TaintFinding, CodeLocation, FindingKind } from "./spec/types";
+import { findingReporting, groupFindingsForPresentation, FindingGroup } from "./findingUtils";
 import { Internal } from "./Internal";
 
-function reportHeader(findings: TaintFinding[], groups: FindingGroup[]): string {
-    const counts = { security_candidate: 0, file_access: 0, persistence_trace: 0 };
-    for (const finding of findings) counts[findingReporting(finding.sink).kind]++;
-    return (
-        `Found ${findings.length} modeled taint flows in ${groups.length} presentation groups: ` +
-        `${counts.security_candidate} modeled security candidates, ${counts.file_access} file-access traces, ` +
-        `${counts.persistence_trace} generic persistence traces.\n` +
-        "These traces do not establish exploitability, disclosure, privilege crossing, or an attacker boundary.\n"
+const kindNouns: Record<FindingKind, string> = {
+    security_candidate: "security candidate",
+    file_access: "file-access trace",
+    persistence_trace: "persistence trace",
+};
+
+function countOf(count: number, noun: string): string {
+    return `${count} ${noun}${count === 1 ? "" : "s"}`;
+}
+
+const severityOrder = ["CRITICAL", "HIGH", "MEDIUM", "LOW"];
+
+function severityOf(finding: TaintFinding): string {
+    return (finding.sink.severity || "high").toUpperCase();
+}
+
+/** One row per severity and sink category, most severe first. */
+function reportHeader(findings: TaintFinding[]): string {
+    const rows = new Map<string, { severity: string; category: string; count: number }>();
+    for (const finding of findings) {
+        const severity = severityOf(finding);
+        const category = finding.sink.categories.join(", ") || "unknown";
+        const key = `${severity}\u0000${category}`;
+        const row = rows.get(key) ?? { severity, category, count: 0 };
+        row.count++;
+        rows.set(key, row);
+    }
+    const sorted = [...rows.values()].sort(
+        (a, b) =>
+            severityOrder.indexOf(a.severity) - severityOrder.indexOf(b.severity) ||
+            b.count - a.count ||
+            a.category.localeCompare(b.category),
     );
+    const severityWidth = Math.max(...sorted.map((row) => row.severity.length));
+    const categoryWidth = Math.max(...sorted.map((row) => row.category.length));
+    return [
+        `Found ${countOf(findings.length, "taint flow")}:`,
+        ...sorted.map(
+            (row) => `  ${row.severity.padEnd(severityWidth)}  ${row.category.padEnd(categoryWidth)}  ${row.count}`,
+        ),
+        "Findings are candidates for further review, not confirmed security issues.",
+        "",
+    ].join("\n");
 }
 
 function groupTitle(group: FindingGroup, index: number, total: number): string {
     const f = group.findings[0];
+    const noun = kindNouns[findingReporting(f.sink).kind];
     return (
-        `[${index + 1}/${total}] ${findingKindLabels[findingReporting(f.sink).kind]} ` +
-        `(${f.sink.categories.join(", ")}; ${group.findings.length} raw findings)`
+        `[${index + 1}/${total}] ${noun[0].toUpperCase()}${noun.slice(1)} ` +
+        `(${f.sink.categories.join(", ")}; ${countOf(group.findings.length, "trace")})`
     );
 }
 
@@ -33,17 +68,14 @@ function groupTitle(group: FindingGroup, index: number, total: number): string {
 export function formatFindings(findings: TaintFinding[], repoRoot?: string, rev?: string): string {
     if (findings.length === 0) return "No taint flows detected.";
     const groups = groupFindingsForPresentation(findings);
-    const lines: string[] = [reportHeader(findings, groups)];
+    const lines: string[] = [reportHeader(findings)];
     for (let i = 0; i < groups.length; i++) {
         const group = groups[i];
         lines.push("─".repeat(70), groupTitle(group, i, groups.length));
         for (let j = 0; j < group.findings.length; j++) {
             const f = group.findings[j];
-            lines.push(
-                `  Trace ${j + 1}/${group.findings.length}: ${(f.sink.severity || "high").toUpperCase()}: ${f.sink.description}`,
-            );
-            lines.push(`  Raw finding / entry context: ${f.handle}`);
-            lines.push(`  ${findingReporting(f.sink).limitation}`, "");
+            lines.push(`  Trace ${j + 1}/${group.findings.length}: ${severityOf(f)}: ${f.sink.description}`);
+            lines.push(`  Handle: ${f.handle}`, "");
             lines.push(`  Source: ${f.source.description}`);
             lines.push(`    at ${formatLocation(f.sourceLocation, repoRoot, rev)}`, "");
             if (f.propagationChain.length > 0) {
@@ -123,7 +155,7 @@ export function formatFindingsMermaid(findings: TaintFinding[], repoRoot?: strin
                 node(`P${id}_${j}`, step.description, step.location);
             }
             const sinkId = `K${id}`;
-            node(sinkId, `${(f.sink.severity || "high").toUpperCase()}: Sink: ${f.sink.description}`, f.sinkLocation);
+            node(sinkId, `${severityOf(f)}: Sink: ${f.sink.description}`, f.sinkLocation);
             let previous = srcId;
             for (let j = 0; j < f.propagationChain.length; j++) {
                 const next = `P${id}_${j}`;
@@ -135,5 +167,5 @@ export function formatFindingsMermaid(findings: TaintFinding[], repoRoot?: strin
         lines.push(...clicks, "```");
         blocks.push(lines.join("\n"));
     }
-    return reportHeader(findings, groups) + blocks.join("\n\n");
+    return reportHeader(findings) + blocks.join("\n\n");
 }

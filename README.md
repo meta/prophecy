@@ -118,14 +118,14 @@ Using preset: auto
   → EP 2/2: URI handler (vscode:// deeplink) @ /path/to/prophecy/tests-unit/static/fixtures/uri-handler-rce/extension.ts:15:13
 Discovered 2 entry point(s)
 
-Found 1 modeled taint flows in 1 presentation groups: 1 modeled security candidates, 0 file-access traces, 0 generic persistence traces.
-These traces do not establish exploitability, disclosure, privilege crossing, or an attacker boundary.
+Found 1 taint flow:
+  CRITICAL  rce  1
+Findings are candidates for further review, not confirmed security issues.
 
 ──────────────────────────────────────────────────────────────────────
-[1/1] Modeled security candidate (rce; 1 raw findings)
+[1/1] Security candidate (rce; 1 trace)
   Trace 1/1: CRITICAL: Command execution via child_process.exec
-  Raw finding / entry context: handleUri.uri|exec|URI handler (vscode:// deeplink)|/path/to/prophecy/tests-unit/static/fixtures/uri-handler-rce/extension.ts|17
-  Modeled security candidate; exploitability and attacker boundary not established.
+  Handle: handleUri.uri|exec|URI handler (vscode:// deeplink)|/path/to/prophecy/tests-unit/static/fixtures/uri-handler-rce/extension.ts|17
 
   Source: URI handler parameter (attacker-controlled via vscode:// deeplink)
     at /path/to/prophecy/tests-unit/static/fixtures/uri-handler-rce/extension.ts:15:23  [uri: vscode.Uri]

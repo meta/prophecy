@@ -85,10 +85,9 @@ describe("precision reporting", () => {
         const text = formatFindings(findings);
         const mermaid = formatFindingsMermaid(findings);
         for (const output of [text, mermaid]) {
-            expect(output).toContain("2 modeled taint flows in 1 presentation groups");
-            expect(output).toContain("2 modeled security candidates");
+            expect(output).toContain("Found 2 taint flows:\n  HIGH  rce  2\n");
             expect(output).not.toMatch(/vulnerabilit/i);
-            expect(output).toContain("attacker boundary");
+            expect(output).toContain("not confirmed security issues");
             for (const f of findings) {
                 expect(output).toContain(f.handle);
                 expect(output).toContain(f.propagationChain[0].location.fileName);
@@ -144,7 +143,7 @@ describe("precision reporting", () => {
         ]);
         for (const output of [formatFindings(findings), formatFindingsMermaid(findings)]) {
             expect(output).toContain(
-                "1 modeled security candidates, 1 file-access traces, 1 generic persistence traces",
+                "Found 3 taint flows:\n  HIGH  file_write      1\n  LOW   file_access     1\n  LOW   file_integrity  1\n",
             );
         }
         const { issues } = sapp(findings);

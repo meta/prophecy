@@ -302,7 +302,7 @@ async function runAnalysis(argv: CliArgs): Promise<number> {
 
     if (argv.format === "text" || argv.format === "mermaid") {
         console.log(`Analyzing ${projectDirs.length > 0 ? projectDirs.join(", ") : (argv.diff ?? patchFile)}...`);
-        console.log(`Using preset: ${argv.preset}`);
+        console.log(argv.spec ? `Using spec: ${argv.spec}` : `Using preset: ${argv.preset}`);
         console.log("");
     }
 

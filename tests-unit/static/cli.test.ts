@@ -156,8 +156,21 @@ describe("CLI smoke tests", () => {
             const permissive = runCli(`${args} --format text`);
             expect(permissive.exitCode).toBe(0);
             expect(permissive.stderr).toContain("Missing type declarations");
-            expect(permissive.stdout).toContain("Found 1 modeled taint flows");
-            expect(permissive.stdout).toContain("1 modeled security candidates");
+            expect(permissive.stdout).toContain("Found 1 taint flow:\n  CRITICAL  rce  1\n");
+        } finally {
+            fs.rmSync(directory, { recursive: true, force: true });
+        }
+    });
+
+    it("names the custom spec instead of the unused preset", () => {
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), "prophecy-cli-spec-"));
+        const spec = path.join(directory, "spec.json");
+        fs.writeFileSync(spec, JSON.stringify({ sources: [], sinks: [], sanitizers: [] }));
+        try {
+            const { stdout, exitCode } = runCli(`--project ${path.join(FIXTURES, "uri-handler-rce")} --spec ${spec}`);
+            expect(exitCode).toBe(0);
+            expect(stdout).toContain(`Using spec: ${spec}`);
+            expect(stdout).not.toContain("Using preset");
         } finally {
             fs.rmSync(directory, { recursive: true, force: true });
         }
