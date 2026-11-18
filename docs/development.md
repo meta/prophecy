@@ -1,7 +1,8 @@
 # Development
 
 Run the commands below from the Prophecy project root. For installation and
-analysis commands, see [Getting started](../README.md#getting-started).
+analysis commands, see [Getting started](../README.md#getting-started). For how
+the analyzer works, see [architecture](architecture.md).
 
 Tests include inline source cases, multi-file fixtures, CLI behavior, and
 output-format checks. Run the full suite or pass a Jest filter for a subset:
@@ -12,6 +13,19 @@ pnpm test --runInBand --testPathPattern=e2e
 pnpm test --runInBand --testNamePattern=websocket
 pnpm test:pnpm  # install/build/scan a pnpm-isolated VS Code extension
 ```
+
+Focused suites for framework models and report kinds:
+
+```bash
+pnpm build
+pnpm exec jest --config jest.static.config.js --runInBand \
+  --testPathPattern='frameworkCoverage|nodeApi|apiBoundary|presetCoverage|httpRequest|eventFlowRequest|discovery'
+pnpm exec jest --config jest.static.config.js --runInBand --testPathPattern=precisionReporting
+```
+
+The framework suites use positive flows, clean controls, unrelated APIs with
+the same names, and cross-file helpers. `precisionReporting` covers grouping,
+finding kinds, and complete JSON and SAPP output.
 
 Lint with [oxlint](https://oxc.rs/docs/guide/usage/linter) and format with
 [oxfmt](https://oxc.rs/docs/guide/usage/formatter). Both skip
@@ -40,6 +54,9 @@ pnpm format:check  # list files oxfmt would change; exits 1 if any
    [`tests-unit/static/e2e.test.ts`](../tests-unit/static/e2e.test.ts), then run
    `pnpm test`.
 
+A new field on a spec type also needs a rule in `src/static/spec/validate.ts`;
+the build fails until the schema matches the type.
+
 A new project type needs a `TaintSpec` in `src/static/spec/`, auto-detection in
 `detectSpec()` in `src/static/analyzer.ts`, and a preset in
 `src/static/spec/presets.ts` if it should be usable without `--spec`. Engine changes
@@ -50,8 +67,9 @@ outside the supported models.
 
 Each fixture models an attack pattern, an analyzer capability, or a robustness
 case. Expectations live in the tests, mostly
-[`tests-unit/static/e2e.test.ts`](../tests-unit/static/e2e.test.ts); a fixture
-name alone does not establish whether it should produce findings.
+[`tests-unit/static/e2e.test.ts`](../tests-unit/static/e2e.test.ts), not in the
+fixture names. The tables below describe a selection; every fixture is in
+`tests-unit/static/fixtures/`.
 
 **Expected to report findings:**
 
@@ -89,6 +107,7 @@ name alone does not establish whether it should produce findings.
 | `websocket-server-rce`           | WebSocket message → `executeCommand`                                                                      |
 | `void-expression-sink`           | A `void expr` operand still reaches the sink                                                              |
 | `express-rce`                    | Express routes → web and shared Node.js sinks                                                             |
+| `custom-spec`                    | The README's custom spec example: a webhook callback → `exec`, with `parseInt` as a sanitizer             |
 
 **Discovery, sanitizers, and robustness:**
 

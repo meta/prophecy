@@ -1,140 +1,129 @@
 # Framework and API coverage
 
-A preset defines a trust boundary, not a proof that a deployment is exploitable.
-Install the analyzed project's declarations where available. New framework and
-wrapper rules require API identity through imports, supported factories, host
-callback types, or external declarations; a local method with the same name is
-not sufficient.
+A preset defines which inputs Prophecy treats as untrusted. It does not show
+that a deployment is exploitable. Install the analyzed project's type
+declarations where they exist: framework and wrapper rules match on API
+identity, established through imports, supported factories, host callback
+types, or declarations. A local method with the same name does not match.
 
 ## Presets
 
-| Preset     | Modeled input                                                                                                     | Selected sinks and exclusions                                                                                                                      |
-| ---------- | ----------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `electron` | `ipcMain.handle/handleOnce/on/once/addListener` payload parameters after the event; `app` `open-url` URL argument | Shared Node sinks and `shell.openExternal`; host event metadata and unrelated application events are not input sources                             |
-| `express`  | Request fields and header accessors; route callbacks, `use`, `head`, `options`, and `app.route(path)` handlers    | Shared Node sinks; response body, redirects, selected template name, and served file paths; request `app`/response metadata is not blanket-tainted |
+| Preset             | Sources                                                                                                                                                                                                                       | Sinks and exclusions                                                                                                                                                                                  |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `vscode-extension` | URI handler and webview message parameters, debug configuration callbacks, workspace settings, document content, file reads and names, selected command output, clipboard reads, input dialogs, HTTP requests, message events | Shared Node sinks; terminals, commands, language-client launch options, debug configuration fields that run commands, webview HTML, external URLs, and workspace edits. `process.env` is not a source |
+| `isl`              | Same as `vscode-extension`                                                                                                                                                                                                    | Adds ISL's command wrappers, the executable a `RepositoryCache` context names, and file reads and deletes                                                                                             |
+| `electron`         | `ipcMain.handle/handleOnce/on/once/addListener` payload parameters after the event; the `app` `open-url` URL argument                                                                                                         | Shared Node sinks and `shell.openExternal`. Host event metadata and unrelated application events are not sources                                                                                      |
+| `express`          | Request fields and header accessors in route callbacks and `use`, `head`, `options`, and `app.route(path)` handlers                                                                                                           | Shared Node sinks; response bodies, redirects, selected template names, and served file paths. The request's `app` and response metadata are not tainted as a whole                                   |
 
-The Express preset includes scoped Node HTTP/HTTPS server request models.
-These models do not claim complete framework coverage or establish a
-framework's entire lifecycle, authentication, or middleware ordering.
-
-`auto` chooses one preset per root, in this order: ISL package names, VS Code,
-Electron, Express.
-Unrecognized metadata retains the VS Code fallback. Use `--preset` for an
-explicit selection or `--spec` for a composed model.
+The Express preset also models Node `http` and `https` server requests. It
+does not model authentication, middleware ordering beyond what is described
+below, or a framework's full lifecycle. For how `--preset auto` chooses a
+preset, see [presets](../README.md#presets).
 
 ## Express middleware
 
-Normal middleware can carry request and response instance state through
-`next()`, including `res.locals`. A terminal handler that does not call `next()`
-does not automatically execute downstream handlers. The model is bounded to
-supported same-receiver registrations, lexical registration scope, and static
-path relationships. Within one statement list, direct `const` aliases and
-static-field `=` writes distinguish receiver identities. Branch/helper writes,
-computed paths, root-variable rebinding, and cross-module mutation are not
-tracked. Handler functions may be imported from another file;
-arbitrary registration order across modules is not inferred. One-level direct
-`app.use(staticPath, router)` mounts can pass earlier parent middleware state
-into the router's matching route. Nested mounts, mixed callback/router argument
-lists, dynamic or parameterized mount paths, error middleware, and
-`next(error)`/`next("route")` transitions are not modeled as normal continuations.
+- Normal middleware passes request and response state, including `res.locals`,
+  to later handlers through `next()`. A handler that does not call `next()`
+  does not run the handlers after it.
+- Registrations are linked only when they use the same receiver in one lexical
+  scope with static paths. Within one statement list, direct `const` aliases
+  and static-field `=` assignments tell receivers apart.
+- Handler functions can be imported from another file, but registration order
+  across modules is not inferred.
+- One level of `app.use(staticPath, router)` passes earlier parent middleware
+  state into the router's matching route.
+- Not modeled as normal continuations: nested mounts, argument lists that mix
+  callbacks and routers, dynamic or parameterized mount paths, error
+  middleware, `next(error)`, and `next("route")`.
+- Not tracked: receiver writes inside branches or helpers, computed paths,
+  rebinding the root variable, and mutation from another module.
 
-`res.render(view, locals)` treats the view name as template-file selection
-(`lfi`). Ordinary locals are data, not automatically template source. This does
-not prove that every locals key or template is safe: engine-specific options,
-unescaped output, and dynamically compiled template strings require separate
-sink/context rules.
+## Express templates and responses
 
-`res.send` keeps string and unknown bodies as HTML/XSS candidates. Runtime object
-and array constructions can use Express's default JSON serialization. Type
-assertions or a declared object type do not prove that runtime shape. The
-precise JSON case requires a direct inline handler on a fresh, locally known
-`express()` or `Router()` allocation, with no middleware or potential header
-setters in that file. Opaque application factories and imported application
-state remain candidates. This does not grant
-JSON strings sanitizer credit: `res.send(JSON.stringify(value))` is still a
-string response. Visible header setters, nonstandard response operations,
-response handoffs, and opaque or fluent receivers keep object-body candidates.
-The content-type check is deliberately conservative: a potential header setter
-in another handler in the same file also disables precision. It does not infer
-arbitrary middleware/application setup as a whole-program response invariant.
+`res.render(view, locals)` treats the view name as file selection (`lfi`).
+Locals are data, not template source. Engine-specific options, unescaped
+output, and templates compiled from strings need their own rules.
+
+`res.send` reports a string or unknown body as an XSS candidate. Express
+serializes object and array bodies as JSON by default, but Prophecy only treats
+a body as JSON in a narrow case:
+
+- the handler is written inline on a fresh `express()` or `Router()` created in
+  the same file, and
+- that file has no middleware and no possible header setter, in any handler.
+
+Everything else stays a candidate:
+
+- type assertions and declared object types, which do not prove the runtime
+  shape;
+- `res.send(JSON.stringify(value))`, which is a string response;
+- visible header setters, nonstandard response operations, passing the response
+  to other code, and opaque or fluent receivers;
+- opaque application factories and imported application state.
 
 ## Shared Node APIs
 
-- **Fetch:** requires standard global/declaration identity or the supported
-  `node-fetch` default / `undici.fetch` package exports. Native globals and
-  supported immutable aliases retain their identity; visible global replacement
-  invalidates later reads. An unrelated local function or installer method named
-  `fetch` is not an HTTP request sink. Typed factory results, fields and function
-  parameters also match a request-like callable contract returning a native
-  `Promise<Response>` with recognized DOM/Node/fetch-library response declarations.
-  This retains URL flows through wrapped transports; type-compatible mocks can
-  also produce conservative candidates. The contract is not proof that a function
-  performs network I/O, and a candidate does not establish arbitrary destination control.
-- **Execa and cross-spawn:** model the direct file/argv/options forms, separating
-  executable selection, argument injection, and execution-bearing environment/
-  shell options. Execa tagged templates, bound methods, `command`, and `node`
-  forms are not interchangeable with these signatures and are not modeled here.
-- **Axios:** distinguish URL/destination fields from payload data, query
-  parameters, and headers. URL overloads overwrite `config.url`. Clients created
-  by `axios.create()` carry inherited `baseURL`, `socketPath`, and proxy
-  destination fields into requests. Known clean per-call values override them;
-  proxy objects merge by field. Axios does not inherit `url`, `method`, or
-  `data` defaults into these requests. Unknown config expressions/spreads remain
-  conservative. The model does not evaluate `allowAbsoluteUrls` or prove that a
-  supplied absolute URL makes `baseURL` inactive.
-- **Files:** `readFile`, `readFileSync`, and `createReadStream` check input paths;
-  writes/appends distinguish path and content; `createWriteStream` checks the
-  output path. A proven nonnegative integer `fd` (including `0`) makes a stream's
-  path inactive; unknown or nonliteral file handles remain conservative. A
-  read-path finding does not establish that data was disclosed to
-  an attacker. Directory confinement, symlinks, and destination semantics still
-  require review.
-- **Content sources:** `NodeFileSources` is opt-in. Callback file data is the
-  callback's data parameter, not its error or the API's return handle. Promise
-  and promisified reads deliver their result; `fs-extra.readFile` does so when
-  its arguments establish a Promise overload. Opaque options or a possible
-  callback do not establish that overload. Read streams deliver data to
-  consumers, not through path/file-descriptor metadata. A preset that treats
-  repository files as untrusted may use these sources; a server preset need not
-  treat every local configuration file as attacker-controlled.
+- **Fetch.** Matches the standard global or its declarations, and the
+  `node-fetch` default and `undici.fetch` exports. Native globals and their
+  immutable aliases keep their identity; a visible replacement of the global
+  invalidates later reads. A local function or method named `fetch` is not an
+  HTTP sink. Typed factory results, fields, and parameters also match when
+  they can be called like `fetch` and return a native `Promise<Response>` with
+  a recognized DOM, Node, or fetch-library `Response`. This keeps URL flows
+  through wrapped transports, and can also report type-compatible mocks. A
+  match does not prove network I/O or that the attacker controls the
+  destination.
+- **Execa and cross-spawn.** The direct file, argv, and options forms, with
+  separate rules for the executable, the arguments, and environment or shell
+  options. Execa tagged templates, bound methods, `command`, and `node` are
+  not modeled.
+- **Axios.** URL and destination fields are separate from payload data, query
+  parameters, and headers. URL overloads overwrite `config.url`. Clients from
+  `axios.create()` pass their `baseURL`, `socketPath`, and proxy fields to each
+  request; known clean per-call values override them, and proxy objects merge
+  field by field. `url`, `method`, and `data` defaults are not inherited.
+  Unknown config expressions and spreads stay conservative.
+  `allowAbsoluteUrls` is not evaluated, so an absolute URL is not assumed to
+  bypass `baseURL`.
+- **Files.** `readFile`, `readFileSync`, and `createReadStream` check the input
+  path. Writes and appends have separate path and content rules.
+  `createWriteStream` checks the output path. A literal nonnegative integer
+  `fd`, including `0`, makes a stream's path inactive; an unknown file handle
+  does not. A read-path finding does not show that data reached an attacker,
+  and directory confinement, symlinks, and destination semantics still need
+  review.
+- **File contents as sources.** `NodeFileSources` is opt-in. For callback
+  APIs, the data parameter is the source, not the error or the returned
+  handle. Promise and promisified reads deliver their result;
+  `fs-extra.readFile` does so only when its arguments select the Promise
+  overload, which opaque options or a possible callback do not. Read streams
+  deliver data to their consumers, not through path or descriptor metadata. A
+  preset that treats repository files as untrusted can use these sources; a
+  server preset need not treat every local configuration file as
+  attacker-controlled.
 
-Import identity includes ES imports, CommonJS `require`, `import = require`,
-awaited literal `import("module")`, and supported constant aliases/destructuring.
-An unawaited import Promise or a computed module name does not establish the
-module's API identity. This is not a whole-program proof that a module export
-or mutable property was never replaced at runtime.
+API identity comes from ES imports, CommonJS `require`, `import = require`,
+awaited literal `import("module")`, and supported constant aliases and
+destructuring. An unawaited import Promise or a computed module name does not
+establish identity. Prophecy does not check whether a module export or mutable
+property is replaced at runtime.
 
-Native `Map`/`Set` cardinality reads retain their input provenance but cannot
-carry HTML, template, or dynamic-code string syntax. The model requires native
-getter declarations plus bounded constructor/immutable-alias origin proof for
-every observed alternative. Casts, unknown typed parameters, opaque receiver
-escapes, known getter/prototype replacements, and local lookalikes do not prove
-native cardinality. Opaque field or return origins remain conservative.
-Cardinality remains a candidate when it selects a file, executable,
-or argument; numeric data is not a general resource-selection sanitizer.
+`Map` and `Set` size reads keep their input's provenance but cannot carry HTML,
+template, or code syntax. This needs native getter declarations and a known
+constructor or immutable-alias origin for every possible value. Casts, unknown
+typed parameters, receivers that escape, replaced getters or prototypes, and
+local lookalike classes do not qualify, and opaque fields and return values
+stay conservative. A size that selects a file, executable, or argument is
+still reported: a number is not a general sanitizer for resource selection.
 
-Custom HTML/XML escaping, JSON script-data encoders, and local shell-quoting
-helpers generally remain conservative candidates. A helper name does not prove
-its implementation or use-site context. In particular, serialized JSON or an
-encoded string can become unsafe when decoded or used in a different context.
+Custom HTML or XML escaping, JSON script-data encoders, and local shell-quoting
+helpers generally stay candidates. A helper's name says nothing about its
+implementation or where its result is used, and serialized JSON or an encoded
+string can become unsafe when it is decoded or used in another context.
 
-Effect writeback from helper branches and callback wrappers remains partial,
-including writes to object parameters. Missing taint after such a call does not
-prove that a field stays clean.
+## Compatibility
 
-## Regression coverage
-
-The focused suites include positive flows, clean controls, unrelated API names,
-and cross-file helpers:
-
-```bash
-pnpm build
-pnpm exec jest --config jest.static.config.js --runInBand \
-  --testPathPattern='frameworkCoverage|nodeApi|apiBoundary|presetCoverage|httpRequest|eventFlowRequest|discovery'
-```
-
-The tests use small declaration fixtures for supported API signatures; they do
-not launch Electron, run framework servers, or exercise browser/network policy.
-Framework-version differences outside those signatures remain a compatibility
-limit. See the [development guide](development.md) for full-suite commands and
-fixture conventions.
+The models are tested against small declaration fixtures for the supported API
+signatures. The tests do not launch Electron, run framework servers, or
+exercise browser or network policy, so framework versions with different
+signatures may not match.

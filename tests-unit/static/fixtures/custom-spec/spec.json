@@ -1,0 +1,33 @@
+{
+    "sources": [
+        {
+            "kind": "parameter",
+            "pattern": "onPush.event",
+            "callbackRegistration": "onPush",
+            "taintAllProperties": true,
+            "description": "Push event payload from the webhook"
+        }
+    ],
+    "sinks": [
+        {
+            "kind": "callArgument",
+            "name": "exec",
+            "pattern": "child_process.exec",
+            "categories": [
+                "rce"
+            ],
+            "severity": "critical",
+            "description": "Command execution via child_process.exec"
+        }
+    ],
+    "sanitizers": [
+        {
+            "kind": "callReturnValue",
+            "pattern": "parseInt",
+            "categories": [
+                "rce"
+            ],
+            "description": "Integer parsing"
+        }
+    ]
+}

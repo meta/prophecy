@@ -10,15 +10,18 @@ import * as path from "path";
 import { analyze } from "../../src/static/analyzer";
 import { formatFindings } from "../../src/static/reporter";
 import { generateSappMetadata } from "../../src/static/sappFormatter";
+import { validateSpec } from "../../src/static/spec/validate";
 
 const root = path.resolve(__dirname, "../..");
 const readme = fs.readFileSync(path.join(root, "README.md"), "utf8");
 const documents = [
     "README.md",
     "SECURITY.md",
+    "docs/architecture.md",
     "docs/development.md",
     "docs/framework-models.md",
-    "docs/precision-reporting.md",
+    "docs/reading-reports.md",
+    "docs/sapp.md",
     ".github/ISSUE_TEMPLATE.md",
     ".github/PULL_REQUEST_TEMPLATE.md",
 ];
@@ -82,5 +85,21 @@ describe("public documentation contracts", () => {
         // Public reports use file locations rather than repository-specific code-browser links.
         const report = formatFindings(result.findings).split(root).join("/path/to/prophecy").trim();
         expect(readme).toContain(report);
+    });
+
+    it("shows the custom spec fixture and the flow it reports", async () => {
+        const section = readme.slice(readme.indexOf("## Custom specs"));
+        const fixture = path.join(root, "tests-unit/static/fixtures/custom-spec");
+        const spec = JSON.parse(fs.readFileSync(path.join(fixture, "spec.json"), "utf8"));
+        expect(JSON.parse(/```json\n([\s\S]*?)\n```/.exec(section)?.[1] ?? "null")).toEqual(spec);
+        // The formatter re-indents code blocks in Markdown.
+        const dedent = (text: string) => text.replace(/^[ \t]+/gm, "");
+        const handler = /```ts\n([\s\S]*?)\n```/.exec(section)?.[1] ?? "missing handler example";
+        expect(dedent(fs.readFileSync(path.join(fixture, "main.ts"), "utf8"))).toContain(dedent(handler));
+        expect(validateSpec(spec)).toEqual([]);
+        const result = await analyze({ projectDir: fixture, spec, outputFormat: "json", requireTypes: true });
+        expect(result.findings.map((finding) => finding.sinkLocation.text)).toEqual([
+            "exec(`git checkout ${event.branch}`)",
+        ]);
     });
 });
