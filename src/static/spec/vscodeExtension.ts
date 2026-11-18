@@ -80,6 +80,7 @@ export const vscodeExtensionSpec: TaintSpec = {
         },
     ],
     sources: [
+        ...(Internal.vscodeExtensionSources ?? []),
         // URI handler — deeplink parameters (T226511721 pattern)
         {
             kind: "parameter",

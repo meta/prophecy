@@ -6,7 +6,7 @@
  */
 
 // @fb-only: import { InternalImports } from "./facebook/InternalImports";
-import { SinkSpec } from "./spec/types";
+import { SinkSpec, SourceSpec } from "./spec/types";
 
 // This should be the only file using fb-only imports. `removeInternalFiles.sh`
 // (and the open source mirror) replaces every `// @fb-only` line with a bare
@@ -25,6 +25,8 @@ export interface InternalApi {
     sappJobInstance(): string | undefined;
     /** Sinks in internal extensions' commands, added to the VS Code spec. */
     vscodeExtensionSinks: SinkSpec[];
+    /** Source boundaries in internal extension frameworks. */
+    vscodeExtensionSources: SourceSpec[];
 }
 
 /**

@@ -72,6 +72,16 @@ export interface SourceSpec {
      * of the handleUri method passed to registerUriHandler is a source.
      */
     callbackRegistration?: string;
+    /**
+     * A host-invoked method implemented by subclasses of a known framework
+     * class. The base class must resolve to this declaration, not merely have
+     * the same name. `declarationFile` is a slash-separated path suffix.
+     */
+    methodDeclaration?: {
+        baseClass: string;
+        declarationFile: string;
+        method: string;
+    };
     /** Require package/type identity instead of registration-name suffix matching. */
     callbackMatch?: "api";
     /** Registration arguments that must resolve to one of the listed static strings. */

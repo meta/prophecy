@@ -1882,6 +1882,9 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
      * must NOT recurse into children itself.
      */
     private inspectNodeForEntryPoints(node: ts.Node, entryPoints: EntryPoint[]): void {
+        if (ts.isClassDeclaration(node) || ts.isClassExpression(node)) {
+            this.extractDeclaredMethodEntryPoints(node, entryPoints);
+        }
         if (
             (ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node)) &&
             node.name &&
@@ -1944,6 +1947,58 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
             taintedParams: new Map(),
             description: "Callback handler for registerCommand",
         });
+    }
+
+    private extractDeclaredMethodEntryPoints(declaration: ts.ClassLikeDeclaration, entryPoints: EntryPoint[]): void {
+        for (const source of this.spec.sources) {
+            const contract = source.methodDeclaration;
+            if (source.kind !== "parameter" || !contract) continue;
+            const methods = declaration.members.flatMap((member) => {
+                if (
+                    !member.name ||
+                    (!ts.isIdentifier(member.name) && !ts.isStringLiteralLike(member.name)) ||
+                    member.name.text !== contract.method ||
+                    (ts.canHaveModifiers(member) &&
+                        ts.getModifiers(member)?.some((modifier) => modifier.kind === ts.SyntaxKind.StaticKeyword))
+                )
+                    return [];
+                const method = memberFunction(member);
+                return method?.body ? [method] : [];
+            });
+            if (!methods.length) continue;
+
+            const matchesBase = (type: ts.Type, seen = new Set<ts.Type>()): boolean => {
+                if (seen.has(type)) return false;
+                seen.add(type);
+                const symbol = type.getSymbol();
+                if (
+                    symbol?.getName() === contract.baseClass &&
+                    symbol.declarations?.some((base) =>
+                        base.getSourceFile().fileName.replace(/\\/g, "/").endsWith(`/${contract.declarationFile}`),
+                    )
+                )
+                    return true;
+                return type.isClassOrInterface() && (type.getBaseTypes() ?? []).some((base) => matchesBase(base, seen));
+            };
+            if (!matchesBase(this.checker.getTypeAtLocation(declaration))) continue;
+
+            for (const method of methods) {
+                const indices = callbackParamIndices(
+                    source,
+                    method.parameters.length,
+                    method.parameters.findIndex((parameter) => parameter.dotDotDotToken != null),
+                );
+                if (!indices.length) continue;
+                entryPoints.push({
+                    kind: "eventHandler",
+                    node: method,
+                    taintedParams: new Map(indices.map((index): [number, SourceSpec] => [index, source])),
+                    parameterTypes: source.callbackParameterTypes,
+                    description:
+                        source.entryPointDescription ?? `Handler method ${contract.baseClass}.${contract.method}`,
+                });
+            }
+        }
     }
 
     /**

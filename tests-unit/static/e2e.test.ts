@@ -14,6 +14,38 @@ import { vscodeExtensionSpec } from "../../src/static/spec/vscodeExtension";
 import { expressSpec } from "../../src/static/spec/express";
 import { analyzeFixture, FIXTURES } from "./testUtils";
 
+describe("E2E: declaration-qualified class callbacks", () => {
+    it("tracks only the payload field through an inherited callback and preserves safe argv", async () => {
+        const result = await analyze({
+            projectDir: path.join(FIXTURES, "class-callback-rce"),
+            spec: {
+                ...vscodeExtensionSpec,
+                sources: [
+                    {
+                        kind: "parameter",
+                        pattern: "hook.input",
+                        description: "Hook payload",
+                        taintAllProperties: true,
+                        paramPropertyPaths: [["payload"]],
+                        methodDeclaration: {
+                            baseClass: "Hook",
+                            declarationFile: "class-callback-rce/framework.ts",
+                            method: "run",
+                        },
+                    },
+                ],
+            },
+        });
+        const rce = result.findings.filter((finding) => finding.sink.categories.includes("rce"));
+        expect(result.entryPointCount).toBe(5);
+        expect(result.skippedEntryPoints).toEqual([]);
+        expect(rce).toHaveLength(1);
+        expect(rce[0].sinkLocation.fileName).toMatch(/command\.ts$/);
+        expect(rce[0].propagationChain.some((step) => step.location.fileName.endsWith("extension.ts"))).toBe(true);
+        expect(result.findings.some((finding) => finding.sink.categories.includes("arg_injection"))).toBe(true);
+    });
+});
+
 /**
  * Read the small fixture output through the same streaming writers used by
  * the CLI, then remove the final newline for assertions. Production streams

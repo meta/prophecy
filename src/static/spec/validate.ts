@@ -97,6 +97,15 @@ const sourceSchema: Schema<SourceSpec> = {
     description: required(string),
     taintAllProperties: boolean,
     callbackRegistration: string,
+    methodDeclaration: {
+        type: {
+            object: {
+                baseClass: required(string),
+                declarationFile: required(string),
+                method: required(string),
+            },
+        },
+    },
     callbackMatch: oneOf("api"),
     callbackArgumentValues: record,
     requireAPIIdentity: boolean,
