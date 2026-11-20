@@ -9,8 +9,9 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { analyze, detectSpec } from "../../src/static/analyzer";
-import { IslSinks, islSpec } from "../../src/static/spec/isl";
+import { IslSinks, IslSources, islSpec } from "../../src/static/spec/isl";
 import { vscodeExtensionSpec } from "../../src/static/spec/vscodeExtension";
+import { apiBoundaryFixture } from "./apiBoundaryFixture";
 
 function projectWithPackage(pkg: object): string {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "isl-spec-"));
@@ -36,6 +37,10 @@ describe("ISL spec", () => {
         const addedNames = IslSinks.map((sink) => sink.name);
         expect(new Set(addedNames).size).toBe(addedNames.length);
         expect(addedNames.some((name) => baseNames.has(name))).toBe(false);
+    });
+
+    it("adds ISL sources to every VS Code extension source", () => {
+        expect(islSpec.sources).toEqual([...vscodeExtensionSpec.sources, ...IslSources]);
     });
 
     it.each(["sapling-scm", "isl-server"])("is detected for the %s package", (name) => {
@@ -86,5 +91,112 @@ describe("ISL spec", () => {
         expect(result.findings.map((finding) => `${finding.sink.name}: ${finding.sinkLocation.text}`)).toEqual([
             'isl_ejeca_args: ejeca("tool", args, { cwd })',
         ]);
+    });
+
+    it("reports client arguments handed to a runner other than Sapling", async () => {
+        const result = await analyzeSource(`
+            import * as vscode from "vscode";
+            interface Provider {
+                runExternalCommand(cwd: string, args: Array<string>): Promise<void>;
+                runConfCommand(cwd: string, args: Array<string>): Promise<void>;
+            }
+            declare const provider: Provider;
+            declare function runArcanistCommand(cwd: string, args: Array<string>): Promise<void>;
+            export function activate(panel: vscode.WebviewPanel) {
+                panel.webview.onDidReceiveMessage((message: { args: Array<string> }) => {
+                    void provider.runExternalCommand("/repo", message.args);
+                    void provider.runConfCommand("/repo", message.args);
+                    void runArcanistCommand("/repo", message.args);
+                    void provider.runExternalCommand("/repo", ["get"]);
+                });
+            }
+        `);
+        expect(result.findings.map((finding) => finding.sink.name).sort()).toEqual([
+            "isl_runArcanistCommand",
+            "isl_runConfCommand",
+            "isl_runExternalCommand",
+        ]);
+    });
+
+    it("reports client data piped to a command's standard input, but not its other options", async () => {
+        const result = await analyzeSource(`
+            import * as vscode from "vscode";
+            declare function ejeca(file: string, args: Array<string>, options?: object): Promise<unknown>;
+            export function activate(panel: vscode.WebviewPanel) {
+                panel.webview.onDidReceiveMessage((message: { stack: string; cwd: string }) => {
+                    void ejeca("sl", ["debugimportstack"], { input: message.stack });
+                    void ejeca("sl", ["status"], { cwd: message.cwd });
+                });
+            }
+        `);
+        expect(result.findings.map((finding) => `${finding.sink.name}: ${finding.sinkLocation.text}`)).toEqual([
+            'isl_ejeca_stdin: ejeca("sl", ["debugimportstack"], { input: message.stack })',
+        ]);
+    });
+
+    it("reports a client-chosen editor setting and a client-chosen path to open", async () => {
+        const result = await analyzeSource(`
+            import * as vscode from "vscode";
+            import * as fs from "fs";
+            export function activate(panel: vscode.WebviewPanel) {
+                panel.webview.onDidReceiveMessage((message: { config: string; value: string; path: string }) => {
+                    void vscode.workspace.getConfiguration().update(message.config, message.value);
+                    void vscode.workspace.getConfiguration().update("demo.fixed", message.value);
+                    void fs.promises.open(message.path);
+                });
+            }
+        `);
+        expect(result.findings.map((finding) => `${finding.sink.name}:${finding.sinkLocation.line}`).sort()).toEqual([
+            "fs_open_path:8",
+            "vscode_config_update_key:6",
+            "vscode_config_update_value:6",
+            "vscode_config_update_value:7",
+        ]);
+    });
+
+    it("treats the output of a wrapped command as a source", async () => {
+        const result = await analyzeSource(`
+            import { spawn } from "child_process";
+            declare function ejeca(file: string, args: Array<string>): Promise<{ stdout: string }>;
+            export async function activate() {
+                const opener = (await ejeca("sl", ["config", "demo.open-file-cmd"])).stdout;
+                spawn(opener, []);
+            }
+        `);
+        expect(result.findings.map((finding) => `${finding.source.pattern} -> ${finding.sink.name}`)).toEqual([
+            "ejeca -> spawn",
+        ]);
+    });
+
+    it("treats the WebSocket upgrade request as a source", async () => {
+        const dir = apiBoundaryFixture(
+            {
+                "main.ts": `
+            import { WebSocketServer } from "ws";
+            import { exec } from "child_process";
+            const server = new WebSocketServer();
+            server.on("connection", (socket, request) => {
+                exec(new URLSearchParams(request.url).get("cwd"));
+                exec(String(socket));
+            });
+            server.on("close", (socket, request) => { exec(request.url); });
+        `,
+            },
+            `declare module "child_process" { export function exec(command: string): void; }
+             declare module "ws" {
+                 export class WebSocketServer {
+                     on(event: string, callback: (socket: object, request: { url: string }) => void): this;
+                 }
+             }`,
+        );
+        try {
+            const result = await analyze({ projectDir: dir, spec: islSpec, outputFormat: "json" });
+            expect(result.skippedEntryPoints).toEqual([]);
+            expect(result.findings.map((finding) => `${finding.source.pattern}:${finding.sinkLocation.line}`)).toEqual([
+                "ws.WebSocketServer.on.request:6",
+            ]);
+        } finally {
+            fs.rmSync(dir, { recursive: true, force: true });
+        }
     });
 });
