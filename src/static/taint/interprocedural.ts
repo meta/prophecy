@@ -38,6 +38,7 @@ import {
     resolveStaticString,
     superClassExpression,
     unwrapExpression,
+    valueParameters,
 } from "./functionResolver";
 import { resolveNodeLocation } from "./nodeLocation";
 import { AnalysisMetrics, createAnalysisMetrics } from "../metrics";
@@ -252,7 +253,7 @@ function bindCallArguments(
     const boundTaints: (TaintValue[] | undefined)[] = [];
     const boundInstances: (InstanceState | undefined)[] = [];
     const defaults: { parameter: ts.ParameterDeclaration; conditional: boolean }[] = [];
-    declaration.parameters.forEach((parameter, index) => {
+    valueParameters(declaration).forEach((parameter, index) => {
         const uncertain = unknownIndex >= 0 && index >= unknownIndex;
         const rest = parameter.dotDotDotToken != null;
         const candidates = uncertain
@@ -901,7 +902,7 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
         const destructuredParameters: ParameterBinding[] = [];
 
         // Set up tainted parameters
-        const params = entryPoint.node.parameters;
+        const params = valueParameters(entryPoint.node);
         for (const [index, apiType] of Object.entries(entryPoint.parameterTypes ?? {})) {
             const param = params[Number(index)];
             const symbol = param && parameterSymbol(this.checker, param);
@@ -1002,7 +1003,7 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
                 const registration = this.commandRegistry.get(commandName);
                 if (registration?.handler.body) {
                     const { handler, handlerParamOffset } = registration;
-                    const params = handler.parameters;
+                    const params = valueParameters(handler);
                     const enclosingState = new Map(inheritedFieldState);
                     for (const symbol of functionFreeSymbols(checker, handler)) {
                         const taints = callerState.get(symbol);
@@ -1203,7 +1204,7 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
         const calleeReceiver =
             boundFunction && ts.isArrowFunction(funcDecl) ? boundFunction.thisInstance : receiverInstance;
 
-        const params = funcDecl.parameters;
+        const params = valueParameters(funcDecl);
         const bound = bindCallArguments(
             checker,
             funcDecl,
@@ -1592,7 +1593,7 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
         }
 
         const inheritedFieldState = this.extractInstanceFieldState(callerState);
-        const params = ctorDecl.parameters;
+        const params = valueParameters(ctorDecl);
         const bound = bindCallArguments(checker, ctorDecl, newExpr.arguments ?? [], argTaints, argInstances);
         argTaints = bound.taints;
         argInstances = bound.instances;
@@ -1985,8 +1986,8 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
             for (const method of methods) {
                 const indices = callbackParamIndices(
                     source,
-                    method.parameters.length,
-                    method.parameters.findIndex((parameter) => parameter.dotDotDotToken != null),
+                    valueParameters(method).length,
+                    valueParameters(method).findIndex((parameter) => parameter.dotDotDotToken != null),
                 );
                 if (!indices.length) continue;
                 entryPoints.push({
@@ -2033,8 +2034,8 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
                     const taintedParams = new Map(
                         callbackParamIndices(
                             source,
-                            funcDecl.parameters.length,
-                            funcDecl.parameters.findIndex((parameter) => parameter.dotDotDotToken != null),
+                            valueParameters(funcDecl).length,
+                            valueParameters(funcDecl).findIndex((parameter) => parameter.dotDotDotToken != null),
                         ).map((index): [number, SourceSpec] => [index, source]),
                     );
                     if (taintedParams.size > 0) {
@@ -2105,7 +2106,7 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
         const callee = unwrapExpression(call.expression);
         if (!nodes.length || (!ts.isPropertyAccessExpression(callee) && !ts.isElementAccessExpression(callee))) return;
         const model = source.callbackChain!;
-        nodes = nodes.filter((node) => !model.excludedHandlerArities?.includes(node.parameters.length));
+        nodes = nodes.filter((node) => !model.excludedHandlerArities?.includes(valueParameters(node).length));
         if (!nodes.length) return;
         let pathArg = model.pathArgIndex == null ? undefined : call.arguments[model.pathArgIndex];
         if (model.receiverPathArgIndex != null) {
@@ -2133,7 +2134,7 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
                 kind: "eventHandler",
                 node: first.node,
                 taintedParams: new Map(
-                    callbackParamIndices(first.source, first.node.parameters.length).map(
+                    callbackParamIndices(first.source, valueParameters(first.node).length).map(
                         (index): [number, SourceSpec] => [index, first.source],
                     ),
                 ),
@@ -2236,11 +2237,11 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
         }
         const instances = new Map<ts.Symbol, InstanceState>();
         const bindings: ParameterBinding[] = [];
-        const taintedIndices = callbackParamIndices(source, node.parameters.length);
+        const taintedIndices = callbackParamIndices(source, valueParameters(node).length);
         for (const paramIndex of model.sharedParamIndices) {
             if (!shared.has(paramIndex)) {
                 const instance = createInstanceState();
-                const param = node.parameters[paramIndex];
+                const param = valueParameters(node)[paramIndex];
                 if (param && taintedIndices.includes(paramIndex))
                     instance.valueTaints = this.parameterTaints(source, param);
                 shared.set(paramIndex, instance);
@@ -2266,7 +2267,7 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
         for (const [paramIndex, instance] of shared)
             continuation.elementInstances.set(`$param:${paramIndex}`, instance);
         this.continuations.set(token, { handlers, index: index + 1 });
-        node.parameters.forEach((parameter, paramIndex) => {
+        valueParameters(node).forEach((parameter, paramIndex) => {
             const instance = paramIndex === model.nextParamIndex ? continuation : shared.get(paramIndex);
             const apiType = source.callbackParameterTypes?.[paramIndex];
             if (instance && apiType) instance.apiTypes = [apiType];
@@ -2458,8 +2459,8 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
             for (const method of this.resolveHandlerMethods(arg, source.handlerMethod)) {
                 const indices = callbackParamIndices(
                     source,
-                    method.parameters.length,
-                    method.parameters.findIndex((parameter) => parameter.dotDotDotToken != null),
+                    valueParameters(method).length,
+                    valueParameters(method).findIndex((parameter) => parameter.dotDotDotToken != null),
                 );
                 if (!indices.length) continue;
                 entryPoints.push({
@@ -2593,7 +2594,7 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
 
         if (funcDecl) {
             const source = this.findSourceSpec("onMessage");
-            if (source && funcDecl.parameters.length > 0) {
+            if (source && valueParameters(funcDecl).length > 0) {
                 entryPoints.push({
                     kind: "eventHandler",
                     node: funcDecl,

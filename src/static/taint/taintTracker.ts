@@ -35,6 +35,7 @@ import {
     resolveStaticString,
     superClassExpression,
     unwrapExpression,
+    valueParameters,
 } from "./functionResolver";
 import { resolveNodeLocation } from "./nodeLocation";
 import { sinkSiteIdentity } from "./sinkSite";
@@ -4953,11 +4954,11 @@ export class TaintTracker {
                 if (this.interproc && value?.functions.length) {
                     for (const fn of value.functions) {
                         const index = source.paramIndex ?? 0;
-                        const param = fn.declaration.parameters[index];
+                        const param = valueParameters(fn.declaration)[index];
                         if (!param) continue;
                         const taints = this.callbackParameterTaints(source, expr, argTaints, param);
                         if (!taints?.length) continue;
-                        const args = fn.declaration.parameters.map((_, i) => ({
+                        const args = valueParameters(fn.declaration).map((_, i) => ({
                             expression: expr.arguments[callbackArgIdx],
                             taints: i === index ? taints : undefined,
                         }));
@@ -4983,10 +4984,10 @@ export class TaintTracker {
         state: TaintState,
     ): void {
         const paramIdx = source.paramIndex ?? 0;
-        if (callback.parameters.length <= paramIdx) return;
+        if (valueParameters(callback).length <= paramIdx) return;
 
         const callbackState: TaintState = forkTaintState(state);
-        const param = callback.parameters[paramIdx];
+        const param = valueParameters(callback)[paramIdx];
         const sym = this.checker.getSymbolAtLocation(param.name);
 
         const paramTaints = this.callbackParameterTaints(source, callExpr, argTaints, param);
@@ -5080,13 +5081,13 @@ export class TaintTracker {
                 fn.declaration.body,
                 fn.captured,
                 [],
-                fn.declaration.parameters
+                valueParameters(fn.declaration)
                     .slice(0, 2)
                     .map((parameter, index) => ({ parameter, instance: endpoints[index] })),
             );
             this.findings.push(...result.findings);
             this.warnings.push(...result.warnings);
-            for (const param of fn.declaration.parameters.slice(0, 2)) {
+            for (const param of valueParameters(fn.declaration).slice(0, 2)) {
                 const symbol = parameterSymbol(this.checker, param);
                 const outcome = symbol && tracker.instanceFieldState.get(symbol)?.elementInstances.get("$promise");
                 if (outcome) outcomes.push(outcome);
@@ -6570,7 +6571,7 @@ export class TaintTracker {
         }
         const initialCallbackState = new Map(callbackState);
 
-        const elementParameter = callback.parameters[0]?.name;
+        const elementParameter = valueParameters(callback)[0]?.name;
         if (receiverTaints && elementParameter && ts.isIdentifier(elementParameter)) {
             const symbol = this.checker.getSymbolAtLocation(elementParameter);
             if (symbol) {
@@ -7845,8 +7846,8 @@ export class TaintTracker {
         if (!ts.isArrowFunction(callback) && !ts.isFunctionExpression(callback)) {
             return this.sanitizerForCallee(callback);
         }
-        const parameter = callback.parameters[0];
-        if (callback.parameters.length !== 1 || !ts.isIdentifier(parameter.name)) return undefined;
+        const parameter = valueParameters(callback)[0];
+        if (valueParameters(callback).length !== 1 || !ts.isIdentifier(parameter.name)) return undefined;
         let body: ts.Expression | undefined;
         if (!ts.isBlock(callback.body)) {
             body = callback.body;

@@ -155,6 +155,16 @@ function resolveAliasedFunction(
 }
 
 /**
+ * The parameters that receive call arguments. TypeScript's leading `this`
+ * parameter only types the receiver and is erased from the emitted function,
+ * so it holds no argument position.
+ */
+export function valueParameters(fn: ts.SignatureDeclaration): readonly ts.ParameterDeclaration[] {
+    const first = fn.parameters[0];
+    return first && ts.isIdentifier(first.name) && first.name.text === "this" ? fn.parameters.slice(1) : fn.parameters;
+}
+
+/**
  * The function a class or object-literal member holds: a method, or a property
  * initialized with an arrow or function expression (`handleUri = (uri) => {}`),
  * which callers invoke the same way.
@@ -439,7 +449,7 @@ class CommandRegistrationResolver {
         const registeredHandler = resolveFunctionReference(this.checker, expression);
         if (!registeredHandler?.body) return undefined;
 
-        const registeredParamSymbols = registeredHandler.parameters.map((param) =>
+        const registeredParamSymbols = valueParameters(registeredHandler).map((param) =>
             this.checker.getSymbolAtLocation(param.name),
         );
         let forwarded: Pick<CommandRegistrationSummary, "handlerParamIndex" | "handlerParamOffset"> | undefined;
@@ -501,8 +511,8 @@ class CommandRegistrationResolver {
     private parameterIndex(fn: ts.FunctionLikeDeclaration, expression: ts.Expression): number | undefined {
         const symbol = this.symbolAt(expression);
         if (!symbol) return undefined;
-        for (let i = 0; i < fn.parameters.length; i++) {
-            const parameterSymbol = this.checker.getSymbolAtLocation(fn.parameters[i].name);
+        for (let i = 0; i < valueParameters(fn).length; i++) {
+            const parameterSymbol = this.checker.getSymbolAtLocation(valueParameters(fn)[i].name);
             if (parameterSymbol === symbol) return i;
         }
         return undefined;
