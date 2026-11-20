@@ -2610,7 +2610,7 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
             }
         };
         const fromObjectLiteral = (obj: ts.ObjectLiteralExpression) => fromMembers(obj.properties);
-        const fromClassDecl = (decl: ts.ClassDeclaration) => fromMembers(decl.members);
+        const fromClassDecl = (decl: ts.ClassLikeDeclaration) => fromMembers(decl.members);
 
         // Resolve a class reference through import aliases before looking for
         // members — the class is typically declared in another module.
@@ -2619,9 +2619,21 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
             if (sym && sym.flags & ts.SymbolFlags.Alias) {
                 sym = this.checker.getAliasedSymbol(sym);
             }
-            for (const decl of sym?.getDeclarations() ?? []) {
-                if (ts.isClassDeclaration(decl)) fromClassDecl(decl);
+            const classes = (sym?.getDeclarations() ?? []).filter(ts.isClassDeclaration);
+            // A reference that only holds the class, such as a property of an
+            // object that collects optional implementations or a `const`
+            // alias, names it through the instance type it constructs.
+            if (!classes.length) {
+                const constructor = this.checker.getNonNullableType(this.checker.getTypeAtLocation(ref));
+                for (const signature of constructor.getConstructSignatures()) {
+                    for (const decl of signature.getReturnType().getSymbol()?.getDeclarations() ?? []) {
+                        if (ts.isClassLike(decl) && !classes.includes(decl as ts.ClassDeclaration)) {
+                            classes.push(decl as ts.ClassDeclaration);
+                        }
+                    }
+                }
             }
+            classes.forEach(fromClassDecl);
         };
 
         // Case 1: object literal passed inline.
