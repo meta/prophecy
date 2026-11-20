@@ -76,6 +76,14 @@ const DEFAULT_ENTRY_POINT_BUDGET_MS = (() => {
 // passthrough instead of analyzing every implementation at each call site.
 const MAX_OVERRIDE_CANDIDATES = 8;
 
+/** A class field that can hold a function: a declared property or a constructor parameter property. */
+function isStoredCallbackField(declaration: ts.Declaration): boolean {
+    return (
+        (ts.isPropertyDeclaration(declaration) && ts.isClassLike(declaration.parent)) ||
+        (ts.isParameter(declaration) && ts.isParameterPropertyDeclaration(declaration, declaration.parent))
+    );
+}
+
 /** A member declaration that a call can dispatch through: a method or a function-valued property. */
 function isDispatchMember(declaration: ts.Declaration): boolean {
     return (
@@ -337,6 +345,8 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
     private subtypes: Map<ts.Symbol, (ts.ClassLikeDeclaration | ts.InterfaceDeclaration)[]> = new Map();
     /** Function members of object literals, keyed by the member their contextual type declares. */
     private literalImplementations: Map<ts.Declaration, ts.FunctionLikeDeclaration[]> = new Map();
+    /** Functions stored in a class field, keyed by the field or parameter property that holds them. */
+    private storedCallbacks: Map<ts.Declaration, ts.FunctionLikeDeclaration[]> = new Map();
     private settingScopes: SettingScopes | undefined;
     private overrideCandidateCache: WeakMap<ts.Declaration, ts.FunctionLikeDeclaration[] | null> = new WeakMap();
     private handlerRegistrations: HandlerRegistration[] = [];
@@ -577,6 +587,7 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
                     this.arrayPrototypeAccess = true;
                 }
                 if (ts.isObjectLiteralExpression(node)) this.indexLiteralImplementations(node);
+                this.indexStoredCallbacks(node);
                 if (!ts.isClassLike(node) && !ts.isInterfaceDeclaration(node)) return;
                 for (const clause of node.heritageClauses ?? []) {
                     for (const type of clause.types) {
@@ -622,6 +633,64 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
                 const indexed = this.literalImplementations.get(declaration);
                 if (!indexed) this.literalImplementations.set(declaration, [...implementations]);
                 else indexed.push(...implementations.filter((implementation) => !indexed.includes(implementation)));
+            }
+        }
+    }
+
+    /**
+     * Record the functions a program stores in a class field: an argument for
+     * a constructor parameter property, or the right side of an assignment to
+     * a declared field. A call through such a field on a receiver whose state
+     * is unknown can then reach them. The index is flow-insensitive: it does
+     * not say which instance holds which function, or what a closure captured.
+     */
+    private indexStoredCallbacks(node: ts.Node): void {
+        const store = (field: ts.Declaration, handlers: ts.FunctionLikeDeclaration[]) => {
+            const indexed = this.storedCallbacks.get(field);
+            if (!indexed) this.storedCallbacks.set(field, [...handlers]);
+            else indexed.push(...handlers.filter((handler) => !indexed.includes(handler)));
+        };
+        if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+            const target = unwrapExpression(node.left);
+            if (!ts.isPropertyAccessExpression(target)) return;
+            const handlers = this.callbackHandlers(node.right);
+            if (!handlers.length) return;
+            for (const declaration of this.checker.getSymbolAtLocation(target.name)?.getDeclarations() ?? []) {
+                if (isStoredCallbackField(declaration) && !declaration.getSourceFile().isDeclarationFile) {
+                    store(declaration, handlers);
+                }
+            }
+            return;
+        }
+        const construction =
+            ts.isNewExpression(node) ||
+            (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.SuperKeyword);
+        if (!construction || !node.arguments?.length) return;
+        let parameters: readonly ts.ParameterDeclaration[] | undefined;
+        for (const [index, argument] of node.arguments.entries()) {
+            if (ts.isSpreadElement(argument)) return;
+            const handlers = this.callbackHandlers(argument);
+            if (!handlers.length) continue;
+            if (!parameters) {
+                const resolved = this.checker.getResolvedSignature(node)?.getDeclaration();
+                if (!resolved || !ts.isConstructorDeclaration(resolved) || resolved.getSourceFile().isDeclarationFile) {
+                    return;
+                }
+                // A call to an overloaded constructor resolves to an overload
+                // signature. Only the implementation can declare parameter
+                // properties, and its parameters line up with every overload's.
+                const constructor = resolved.body
+                    ? resolved
+                    : resolved.parent.members.find(
+                          (member): member is ts.ConstructorDeclaration =>
+                              ts.isConstructorDeclaration(member) && member.body != null,
+                      );
+                if (!constructor) return;
+                parameters = valueParameters(constructor);
+            }
+            const parameter = parameters[index];
+            if (parameter && !parameter.dotDotDotToken && isStoredCallbackField(parameter)) {
+                store(parameter, handlers);
             }
         }
     }
@@ -1904,7 +1973,10 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
         const member = this.dispatchMember(callExpr);
         if (!member) return [];
         const receiverType = this.checker.getNonNullableType(this.checker.getTypeAtLocation(member.receiver));
-        const method = receiverType.getProperty(member.name)?.getDeclarations()?.find(isDispatchMember);
+        const declarations = receiverType.getProperty(member.name)?.getDeclarations();
+        const method =
+            declarations?.find(isDispatchMember) ??
+            declarations?.find((declaration) => this.storedCallbacks.has(declaration));
         if (!method || method.getSourceFile().isDeclarationFile) return [];
         const cached = this.overrideCandidateCache.get(method);
         if (cached !== undefined) return cached;
@@ -1916,6 +1988,7 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
             }
         };
         addLiteralImplementations(method);
+        const stored = new Set(this.storedCallbacks.get(method));
         const owner = method.parent;
         if (ts.isClassLike(owner)) {
             const implementation = this.methodImplementation(owner, member.name);
@@ -1934,13 +2007,24 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
                     : undefined;
                 if (implementation) candidates.add(implementation);
                 // A literal typed as the subtype implements the member the subtype redeclares.
-                for (const redeclared of subtype.members) {
+                // A subclass or implementing class can hold the member as a field,
+                // declared in its body or as a constructor parameter property.
+                const redeclarations: ts.NamedDeclaration[] = [
+                    ...subtype.members,
+                    ...subtype.members.flatMap((candidate) =>
+                        ts.isConstructorDeclaration(candidate)
+                            ? candidate.parameters.filter(isStoredCallbackField)
+                            : [],
+                    ),
+                ];
+                for (const redeclared of redeclarations) {
                     if (
                         redeclared.name &&
                         (ts.isIdentifier(redeclared.name) || ts.isStringLiteralLike(redeclared.name)) &&
                         redeclared.name.text === member.name
                     ) {
                         addLiteralImplementations(redeclared);
+                        for (const callback of this.storedCallbacks.get(redeclared) ?? []) stored.add(callback);
                     }
                 }
                 const symbol = subtype.name && this.checker.getSymbolAtLocation(subtype.name);
@@ -1949,6 +2033,13 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
                     pending.push(symbol);
                 }
             }
+        }
+        // Stored callbacks join the declared implementations only when all of
+        // them fit under the limit. Otherwise the call keeps the targets it
+        // had without them, such as a field's own initializer.
+        for (const candidate of candidates) stored.delete(candidate);
+        if (candidates.size + stored.size <= MAX_OVERRIDE_CANDIDATES) {
+            for (const callback of stored) candidates.add(callback);
         }
         const result = candidates.size <= MAX_OVERRIDE_CANDIDATES ? [...candidates] : null;
         // An ordinary body with no alternative implementation needs no open-
