@@ -76,6 +76,16 @@ const DEFAULT_ENTRY_POINT_BUDGET_MS = (() => {
 // passthrough instead of analyzing every implementation at each call site.
 const MAX_OVERRIDE_CANDIDATES = 8;
 
+/** A member declaration that a call can dispatch through: a method or a function-valued property. */
+function isDispatchMember(declaration: ts.Declaration): boolean {
+    return (
+        ts.isMethodSignature(declaration) ||
+        ts.isMethodDeclaration(declaration) ||
+        ts.isPropertySignature(declaration) ||
+        ts.isPropertyDeclaration(declaration)
+    );
+}
+
 /**
  * Two streaming 32-bit FNV-style states form a compact non-cryptographic
  * digest. This folds oversized argument-key lists without joining them into
@@ -325,6 +335,8 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
     private closureCache: Map<ts.Node, Map<string, boolean>> = new Map();
     /** Classes and interfaces keyed by each class or interface they directly extend or implement. */
     private subtypes: Map<ts.Symbol, (ts.ClassLikeDeclaration | ts.InterfaceDeclaration)[]> = new Map();
+    /** Function members of object literals, keyed by the member their contextual type declares. */
+    private literalImplementations: Map<ts.Declaration, ts.FunctionLikeDeclaration[]> = new Map();
     private settingScopes: SettingScopes | undefined;
     private overrideCandidateCache: WeakMap<ts.Declaration, ts.FunctionLikeDeclaration[] | null> = new WeakMap();
     private handlerRegistrations: HandlerRegistration[] = [];
@@ -564,6 +576,7 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
                     // Even a prototype alias can be mutated by an unresolved call in another module.
                     this.arrayPrototypeAccess = true;
                 }
+                if (ts.isObjectLiteralExpression(node)) this.indexLiteralImplementations(node);
                 if (!ts.isClassLike(node) && !ts.isInterfaceDeclaration(node)) return;
                 for (const clause of node.heritageClauses ?? []) {
                     for (const type of clause.types) {
@@ -578,6 +591,58 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
             });
         }
         this.indexedArraySortBuiltins = true;
+    }
+
+    /**
+     * Record an object literal's function members as implementations of the
+     * members its contextual type declares: an annotated variable, a declared
+     * return type, a typed parameter or property, or a type assertion. An
+     * interface no class implements then still has dispatch targets. A literal
+     * without a contextual type, such as an unannotated variable later passed
+     * by shape, is not indexed.
+     */
+    private indexLiteralImplementations(literal: ts.ObjectLiteralExpression): void {
+        let contextual: ts.Type | undefined;
+        for (const member of literal.properties) {
+            if (!member.name || (!ts.isIdentifier(member.name) && !ts.isStringLiteralLike(member.name))) continue;
+            const implementations = this.memberHandlers(member);
+            if (!implementations.length) continue;
+            contextual ??= this.checker.getContextualType(literal);
+            if (!contextual) return;
+            const declared = this.checker.getNonNullableType(contextual).getProperty(member.name.text);
+            for (const declaration of declared?.getDeclarations() ?? []) {
+                // A member of another literal (`typeof other`) keeps its own body as the call target.
+                if (
+                    !isDispatchMember(declaration) ||
+                    ts.isObjectLiteralExpression(declaration.parent) ||
+                    declaration.getSourceFile().isDeclarationFile
+                ) {
+                    continue;
+                }
+                const indexed = this.literalImplementations.get(declaration);
+                if (!indexed) this.literalImplementations.set(declaration, [...implementations]);
+                else indexed.push(...implementations.filter((implementation) => !indexed.includes(implementation)));
+            }
+        }
+    }
+
+    /** The functions a class or object-literal member holds: a method, or a property initialized with one. */
+    private memberHandlers(member: ts.ClassElement | ts.ObjectLiteralElementLike): ts.FunctionLikeDeclaration[] {
+        const handler = memberFunction(member);
+        if (handler) return [handler];
+        if ((ts.isPropertyAssignment(member) || ts.isPropertyDeclaration(member)) && member.initializer) {
+            return this.callbackHandlers(member.initializer);
+        }
+        if (!ts.isShorthandPropertyAssignment(member)) return [];
+        let symbol = this.checker.getShorthandAssignmentValueSymbol(member);
+        if (symbol && symbol.flags & ts.SymbolFlags.Alias) symbol = this.checker.getAliasedSymbol(symbol);
+        return (symbol?.declarations ?? []).flatMap((declaration) =>
+            ts.isFunctionDeclaration(declaration)
+                ? [declaration]
+                : ts.isVariableDeclaration(declaration) && declaration.initializer
+                  ? this.callbackHandlers(declaration.initializer)
+                  : [],
+        );
     }
 
     private arrayFromErasedTypeUse(node: ts.Node): boolean {
@@ -1784,7 +1849,8 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
         receiver?: InstanceState,
     ): ts.FunctionLikeDeclaration[] | undefined {
         const member = this.dispatchMember(callExpr);
-        if (!member || !receiver?.classDeclarations?.length) return undefined;
+        if (!member) return undefined;
+        if (!receiver?.classDeclarations?.length) return this.constLiteralTargets(member);
         const implementations = receiver.classDeclarations.map((declaration) =>
             this.methodImplementation(declaration, member.name),
         );
@@ -1798,26 +1864,58 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
         ];
     }
 
+    /**
+     * A `const` bound to an object literal is a concrete receiver even when its
+     * annotation is an interface: the call runs that literal's own member, not
+     * another implementation of the interface. A member that arrives through a
+     * spread is left to open dispatch.
+     */
+    private constLiteralTargets(member: {
+        receiver: ts.Expression;
+        name: string;
+    }): ts.FunctionLikeDeclaration[] | undefined {
+        const receiver = unwrapExpression(member.receiver);
+        if (!ts.isIdentifier(receiver)) return undefined;
+        let symbol = this.checker.getSymbolAtLocation(receiver);
+        if (symbol && symbol.flags & ts.SymbolFlags.Alias) symbol = this.checker.getAliasedSymbol(symbol);
+        const declaration = symbol?.valueDeclaration;
+        if (
+            !declaration ||
+            !ts.isVariableDeclaration(declaration) ||
+            !declaration.initializer ||
+            !(ts.getCombinedNodeFlags(declaration) & ts.NodeFlags.Const)
+        ) {
+            return undefined;
+        }
+        const literal = unwrapExpression(declaration.initializer);
+        if (!ts.isObjectLiteralExpression(literal)) return undefined;
+        const targets = literal.properties.flatMap((property) =>
+            property.name &&
+            (ts.isIdentifier(property.name) || ts.isStringLiteralLike(property.name)) &&
+            property.name.text === member.name
+                ? this.memberHandlers(property)
+                : [],
+        );
+        return targets.length ? targets : undefined;
+    }
+
     /** Expand open dispatch; null distinguishes candidate overflow from an empty set. */
     private overrideCandidates(callExpr: ts.CallExpression): ts.FunctionLikeDeclaration[] | null {
         const member = this.dispatchMember(callExpr);
         if (!member) return [];
         const receiverType = this.checker.getNonNullableType(this.checker.getTypeAtLocation(member.receiver));
-        const method = receiverType
-            .getProperty(member.name)
-            ?.getDeclarations()
-            ?.find(
-                (declaration) =>
-                    ts.isMethodSignature(declaration) ||
-                    ts.isMethodDeclaration(declaration) ||
-                    ts.isPropertySignature(declaration) ||
-                    ts.isPropertyDeclaration(declaration),
-            );
+        const method = receiverType.getProperty(member.name)?.getDeclarations()?.find(isDispatchMember);
         if (!method || method.getSourceFile().isDeclarationFile) return [];
         const cached = this.overrideCandidateCache.get(method);
         if (cached !== undefined) return cached;
 
         const candidates = new Set<ts.FunctionLikeDeclaration>();
+        const addLiteralImplementations = (declaration: ts.Declaration) => {
+            for (const implementation of this.literalImplementations.get(declaration) ?? []) {
+                candidates.add(implementation);
+            }
+        };
+        addLiteralImplementations(method);
         const owner = method.parent;
         if (ts.isClassLike(owner)) {
             const implementation = this.methodImplementation(owner, member.name);
@@ -1835,6 +1933,16 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
                     ? this.methodImplementation(subtype, member.name)
                     : undefined;
                 if (implementation) candidates.add(implementation);
+                // A literal typed as the subtype implements the member the subtype redeclares.
+                for (const redeclared of subtype.members) {
+                    if (
+                        redeclared.name &&
+                        (ts.isIdentifier(redeclared.name) || ts.isStringLiteralLike(redeclared.name)) &&
+                        redeclared.name.text === member.name
+                    ) {
+                        addLiteralImplementations(redeclared);
+                    }
+                }
                 const symbol = subtype.name && this.checker.getSymbolAtLocation(subtype.name);
                 if (symbol && !visited.has(symbol)) {
                     visited.add(symbol);
@@ -2498,20 +2606,7 @@ export class InterproceduralAnalyzer implements InterproceduralContext {
                     member.name.text !== methodName
                 )
                     continue;
-                const handler = memberFunction(member);
-                if (handler) found.push(handler);
-                else if (ts.isPropertyAssignment(member) || ts.isPropertyDeclaration(member)) {
-                    if (member.initializer) found.push(...this.callbackHandlers(member.initializer));
-                } else if (ts.isShorthandPropertyAssignment(member)) {
-                    let symbol = this.checker.getShorthandAssignmentValueSymbol(member);
-                    if (symbol && symbol.flags & ts.SymbolFlags.Alias) symbol = this.checker.getAliasedSymbol(symbol);
-                    for (const declaration of symbol?.declarations ?? []) {
-                        if (ts.isFunctionDeclaration(declaration)) found.push(declaration);
-                        if (ts.isVariableDeclaration(declaration) && declaration.initializer) {
-                            found.push(...this.callbackHandlers(declaration.initializer));
-                        }
-                    }
-                }
+                found.push(...this.memberHandlers(member));
             }
         };
         const fromObjectLiteral = (obj: ts.ObjectLiteralExpression) => fromMembers(obj.properties);

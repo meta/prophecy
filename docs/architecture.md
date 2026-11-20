@@ -110,11 +110,15 @@ empty scan; pass each referenced project as its own `--project`.
 **Method calls.** If Prophecy knows the object's concrete class, it can follow
 that class's method, including overrides and function-valued properties. If it
 only knows an interface or base class, it can look for possible implementations
-in the program. If the search finds more than eight, Prophecy discards that list.
+in the program: classes that extend or implement it, and object literals written
+where that type is expected, such as an annotated variable, a declared return
+type, a typed argument, or a type assertion. If the search finds more than
+eight, Prophecy discards that list.
 It can still analyze method bodies it knows about from the concrete class or
 base class, but it doesn't assume that any of them will run. Type declarations
 alone don't supply a method body, and Prophecy cannot enumerate every target of
-a computed method name or an interface implemented only by shape.
+a computed method name or an object that matches an interface only by shape,
+such as an unannotated literal assigned to a typed variable later.
 
 When Prophecy cannot resolve a call, it may carry taint from the arguments or
 the object receiving the call into the result. That can flag results that do
