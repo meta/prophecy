@@ -337,6 +337,22 @@ export const HttpsRequestSink: SinkSpec = {
     categories: ["ssrf"],
 };
 
+// `get` is `request` with the method fixed and the request ended, so the URL
+// argument selects the destination the same way.
+export const HttpGetSink: SinkSpec = {
+    ...HttpRequestSink,
+    name: "http_get",
+    pattern: "http.get",
+    description: "HTTP GET with attacker-controlled URL (SSRF/CSRF risk)",
+};
+
+export const HttpsGetSink: SinkSpec = {
+    ...HttpsRequestSink,
+    name: "https_get",
+    pattern: "https.get",
+    description: "HTTPS GET with attacker-controlled URL (SSRF/CSRF risk)",
+};
+
 // --- File system ---
 
 // Content control alone does not establish destination or consumer impact.

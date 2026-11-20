@@ -26,7 +26,9 @@ import {
     EvalSink,
     FunctionConstructorSink,
     FetchSink,
+    HttpGetSink,
     HttpRequestSink,
+    HttpsGetSink,
     HttpsRequestSink,
     WriteFileSink,
     WriteFilePathSink,
@@ -297,7 +299,14 @@ export const NodeCommandSinks: SinkSpec[] = [
     ...CrossSpawnSinks,
 ];
 
-export const NodeNetworkSinks: SinkSpec[] = [FetchSink, HttpRequestSink, HttpsRequestSink, ...AxiosSinks];
+export const NodeNetworkSinks: SinkSpec[] = [
+    FetchSink,
+    HttpRequestSink,
+    HttpsRequestSink,
+    HttpGetSink,
+    HttpsGetSink,
+    ...AxiosSinks,
+];
 export const NodeCodeSinks: SinkSpec[] = [EvalSink, FunctionConstructorSink];
 export const NodeFileSinks: SinkSpec[] = [
     WriteFilePathSink,
